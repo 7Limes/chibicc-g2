@@ -12,7 +12,11 @@
 #endif
 
 // Drawing. Each call compiles to a single instruction.
+
+// g2: Set the current color to (`r`, `g`, `b`)
 void color(int r, int g, int b) __attribute__((g2_intrinsic("col")));
+
+// g2: Draw a pixel at (`x`, `y`)
 void pix(int x, int y) __attribute__((g2_intrinsic("pix")));
 
 // Input state, updated by the VM before every frame. Keys are 1 while
