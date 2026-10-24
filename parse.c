@@ -36,7 +36,15 @@ struct Scope {
   // the other is for struct/union/enum tags.
   HashMap vars;
   HashMap tags;
+
+  // Index of a block scope within the current function, or -1. The g2
+  // backend lets locals of sibling scopes share memory.
+  int id;
 };
+
+// Parent scope index of each block scope of the current function.
+static int *scope_parents;
+static int nscopes;
 
 // Variable attributes such as typedef or extern.
 typedef struct {
@@ -86,7 +94,7 @@ static Obj *locals;
 // Likewise, global variables are accumulated to this list.
 static Obj *globals;
 
-static Scope *scope = &(Scope){};
+static Scope *scope = &(Scope){.id = -1};
 
 // Points to the function object the parser is currently parsing.
 static Obj *current_fn;
@@ -162,6 +170,12 @@ static int align_down(int n, int align) {
 
 static void enter_scope(void) {
   Scope *sc = calloc(1, sizeof(Scope));
+  sc->id = -1;
+  if (current_fn) {
+    sc->id = nscopes;
+    scope_parents = realloc(scope_parents, sizeof(int) * (nscopes + 1));
+    scope_parents[nscopes++] = scope->id;
+  }
   sc->next = scope;
   scope = sc;
 }
@@ -304,6 +318,7 @@ static Obj *new_var(char *name, Type *ty) {
 static Obj *new_lvar(char *name, Type *ty) {
   Obj *var = new_var(name, ty);
   var->is_local = true;
+  var->scope = scope->id;
   var->next = locals;
   locals = var;
   return var;
@@ -3038,6 +3053,8 @@ static Token *function(Token *tok, Type *basety, VarAttr *attr) {
   current_fn = fn;
   current_fn_name = NULL;
   locals = NULL;
+  scope_parents = NULL;
+  nscopes = 0;
   enter_scope();
   create_param_lvars(ty->params);
   fn->params = locals;
@@ -3046,8 +3063,14 @@ static Token *function(Token *tok, Type *basety, VarAttr *attr) {
 
   fn->body = compound_stmt(&tok, tok);
   fn->locals = locals;
+  fn->scope_parents = scope_parents;
+  fn->nscopes = nscopes;
   leave_scope();
   resolve_goto_labels();
+
+  // References after the function (e.g. in a global initializer) don't
+  // belong to it.
+  current_fn = NULL;
   return tok;
 }
 

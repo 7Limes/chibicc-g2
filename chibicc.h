@@ -135,6 +135,7 @@ struct Obj {
   // Local variable
   int offset;
   bool is_addr_tmp; // the pointer in chibicc's rewrite of `x op= y`
+  int scope;        // block scope within the function (see scope_parents)
 
   // Global variable or function
   bool is_function;
@@ -170,6 +171,8 @@ struct Obj {
   Node *body;
   Obj *locals;
   int stack_size;
+  int *scope_parents; // parent of each block scope, -1 for the outermost
+  int nscopes;
 
   // Static inline function
   bool is_live;
@@ -449,4 +452,7 @@ bool file_exists(char *path);
 extern StringArray include_paths;
 extern bool opt_fcommon;
 extern int opt_memory;
+extern bool opt_peephole;
+extern bool opt_const_pool;
+extern bool opt_overlay;
 extern char *base_file;

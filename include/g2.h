@@ -16,15 +16,17 @@ void color(int r, int g, int b) __attribute__((g2_intrinsic("col")));
 void pix(int x, int y) __attribute__((g2_intrinsic("pix")));
 
 // Input state, updated by the VM before every frame. Keys are 1 while
-// pressed and 0 otherwise. DELTA is the time since the last frame in ms.
-extern const int CONTROL1 __attribute__((address(3)));
-extern const int CONTROL2 __attribute__((address(4)));
-extern const int A __attribute__((address(5)));
-extern const int B __attribute__((address(6)));
-extern const int UP __attribute__((address(7)));
-extern const int DOWN __attribute__((address(8)));
-extern const int LEFT __attribute__((address(9)));
-extern const int RIGHT __attribute__((address(10)));
+// pressed and 0 otherwise, so they are declared _Bool, which makes tests
+// like `if (UP)` a single jump. DELTA is the time since the last frame
+// in ms.
+extern const _Bool CONTROL1 __attribute__((address(3)));
+extern const _Bool CONTROL2 __attribute__((address(4)));
+extern const _Bool A __attribute__((address(5)));
+extern const _Bool B __attribute__((address(6)));
+extern const _Bool UP __attribute__((address(7)));
+extern const _Bool DOWN __attribute__((address(8)));
+extern const _Bool LEFT __attribute__((address(9)));
+extern const _Bool RIGHT __attribute__((address(10)));
 extern const int DELTA __attribute__((address(11)));
 
 // Data loaded into memory by the assembler. For example,

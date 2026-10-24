@@ -17,7 +17,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 import g2run
 
 
-def run_test(path, compiler, assembler, include, workdir):
+def run_test(path, compiler, assembler, include, workdir, cflags):
     base = os.path.join(workdir, os.path.splitext(os.path.basename(path))[0])
     asm, binary = base + '.g2', base + '.g2b'
 
@@ -27,7 +27,7 @@ def run_test(path, compiler, assembler, include, workdir):
     if first_line.startswith('// expect-error:'):
         expect_error = first_line.removeprefix('// expect-error:').strip()
 
-    r = subprocess.run([compiler, '-I', include, '-o', asm, path],
+    r = subprocess.run([compiler, '-I', include, *cflags, '-o', asm, path],
                        capture_output=True, text=True)
     if expect_error is not None:
         if r.returncode == 0:
@@ -63,6 +63,8 @@ def main():
     parser.add_argument('tests', nargs='*', help='test files (default: test-g2/*.c)')
     parser.add_argument('--compiler', default=os.path.join(root, 'chibicc-g2'))
     parser.add_argument('--assembler', default='g2a')
+    parser.add_argument('--cflags', default='',
+                        help='extra compiler flags, e.g. "-fno-overlay -fno-peephole"')
     args = parser.parse_args()
 
     tests = args.tests
@@ -75,7 +77,8 @@ def main():
     failures = 0
     with tempfile.TemporaryDirectory() as workdir:
         for path in tests:
-            error = run_test(path, args.compiler, args.assembler, include, workdir)
+            error = run_test(path, args.compiler, args.assembler, include, workdir,
+                             args.cflags.split())
             name = os.path.relpath(path, root)
             if error:
                 failures += 1

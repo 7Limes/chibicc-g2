@@ -7,6 +7,11 @@ bool opt_fcommon = true;
 // as much memory as the program needs.
 int opt_memory;
 
+// Optimizations, each of which can be turned off with -fno-<name>.
+bool opt_peephole = true;   // -fpeephole
+bool opt_const_pool = true; // -fconst-pool
+bool opt_overlay = true;    // -foverlay
+
 static StringArray opt_include;
 static bool opt_E;
 static bool opt_M;
@@ -22,7 +27,9 @@ static StringArray std_include_paths;
 char *base_file;
 
 static void usage(int status) {
-  fprintf(stderr, "chibicc-g2 [ -o <path> ] [ -E ] [ -I<dir> ] [ -D<name>[=<value>] ] [ -mmemory=<slots> ] <file.c>\n");
+  fprintf(stderr, "chibicc-g2 [ -o <path> ] [ -E ] [ -I<dir> ] [ -D<name>[=<value>] ]\n"
+                  "           [ -mmemory=<slots> ] [ -fno-peephole ] [ -fno-const-pool ]\n"
+                  "           [ -fno-overlay ] <file.c>\n");
   exit(status);
 }
 
@@ -119,6 +126,21 @@ static void parse_args(int argc, char **argv) {
 
     if (!strcmp(argv[i], "-fno-common")) {
       opt_fcommon = false;
+      continue;
+    }
+
+    if (!strcmp(argv[i], "-fpeephole") || !strcmp(argv[i], "-fno-peephole")) {
+      opt_peephole = argv[i][2] != 'n';
+      continue;
+    }
+
+    if (!strcmp(argv[i], "-fconst-pool") || !strcmp(argv[i], "-fno-const-pool")) {
+      opt_const_pool = argv[i][2] != 'n';
+      continue;
+    }
+
+    if (!strcmp(argv[i], "-foverlay") || !strcmp(argv[i], "-fno-overlay")) {
+      opt_overlay = argv[i][2] != 'n';
       continue;
     }
 

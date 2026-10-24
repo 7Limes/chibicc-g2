@@ -199,7 +199,7 @@ void add_type(Node *node) {
       error_tok(node->lhs->tok, "not an lvalue");
     if (node->lhs->ty->is_const && !node->is_init)
       error_tok(node->tok, "cannot assign to a const object");
-    if (node->lhs->ty->kind != TY_STRUCT)
+    if (node->lhs->ty->kind != TY_STRUCT && node->lhs->ty->kind != TY_UNION)
       node->rhs = new_cast(node->rhs, node->lhs->ty);
     node->ty = node->lhs->ty;
     return;

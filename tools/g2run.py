@@ -59,14 +59,15 @@ class VM:
     def __init__(self, program, max_steps):
         self.program = program
         self.max_steps = max_steps
-        size = program.memory_size + len(program.data)
-        self.memory = [0] * size
+        # The assembler includes the loaded data in the memory size.
+        self.memory = [0] * program.memory_size
         self.memory[15] = CALL_STACK_ADDRESS
         if program.data_address > 0:
             self.memory[program.data_address:program.data_address + len(program.data)] = program.data
         self.color = (0, 0, 0)
         self.frame_count = 0
         self.steps = 0
+        self.counts = [0] * len(program.instructions)  # executions per instruction
 
     def get(self, addr):
         if addr < 0 or addr >= len(self.memory):
@@ -92,6 +93,7 @@ class VM:
             if steps > self.max_steps:
                 raise VMError(f'frame {self.frame_count} exceeded {self.max_steps} instructions')
             op, a0, a1, a2 = ins[pc]
+            self.counts[pc] += 1
             pc += 1
             if op == 0:    # ldi
                 self.set(a0, a1)
@@ -180,6 +182,11 @@ def main():
     parser.add_argument('--print', action='append', default=[], metavar='NAME[:COUNT]',
                         help='print a memory value by define name or address')
     parser.add_argument('--pixels', action='store_true', help='print pixels drawn in the last frame')
+    parser.add_argument('--profile', metavar='EXPANDED',
+                        help='print instructions executed per label, using a listing'
+                             ' from `g2a --expand`')
+    parser.add_argument('--stats', action='store_true',
+                        help='print the program size and the instructions executed per frame')
     args = parser.parse_args()
 
     symbols = read_symbols(args.symbols) if args.symbols else {}
@@ -195,6 +202,33 @@ def main():
         addr = symbols[name] if name in symbols else int(name)
         values = vm.memory[addr:addr + int(count or 1)]
         print(f'{name} = {values[0] if not count else values}')
+    if args.stats:
+        p = vm.program
+        print(f'instructions: {len(p.instructions)}')
+        print(f'memory: {p.memory_size} (including {len(p.data)} data)')
+        print(f'executed: {vm.steps} in {vm.frame_count} frames'
+              f' ({vm.steps / max(1, vm.frame_count):.1f} per frame)')
+    if args.profile:
+        # The expanded listing has labels followed by instructions whose
+        # trailing comment is the instruction index.
+        label_at = {}
+        pending = []
+        with open(args.profile) as f:
+            for line in f:
+                line = line.strip()
+                if line.endswith(':'):
+                    pending.append(line[:-1])
+                elif ';' in line and pending:
+                    label_at[int(line.rsplit(';', 1)[1])] = pending[-1]
+                    pending = []
+        totals = {}
+        label = '(start)'
+        for i, n in enumerate(vm.counts):
+            label = label_at.get(i, label)
+            totals[label] = totals.get(label, 0) + n
+        for label, n in sorted(totals.items(), key=lambda kv: -kv[1]):
+            if n:
+                print(f'{n / vm.frame_count:10.1f}  {label}')
     if args.pixels:
         for x, y, c in pixels:
             print(f'pixel {x} {y} {c[0]} {c[1]} {c[2]}')

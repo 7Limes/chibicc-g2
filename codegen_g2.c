@@ -64,7 +64,6 @@ static int nfns;
 static HashMap fn_infos; // function name -> FnInfo
 
 static FnInfo *current;
-static FILE *out;         // current function's code buffer
 static bool unreachable;  // true after ret/ja until the next label
 static int label_count;
 
@@ -88,17 +87,7 @@ static void emit(char *fmt, ...) __attribute__((format(printf, 1, 2)));
 // in `line`, or NULL. Immediate values are not addresses, so the last
 // operand of ldi and of the *i pseudo-instructions is skipped, as are the
 // labels of jumps.
-static char *address_comment(char *line) {
-  if (strchr(line, ';'))
-    return NULL;
-
-  char *buf = strdup(line);
-  char *ops[4];
-  int n = 0;
-  char *mnemonic = strtok(buf, " ");
-  for (char *t = strtok(NULL, " "); t && n < 4; t = strtok(NULL, " "))
-    ops[n++] = t;
-
+static char *address_comment(char *mnemonic, char **ops, int n) {
   int first = 0, last = n;
   if (!strcmp(mnemonic, "ldi") || !strcmp(mnemonic, "addi") || !strcmp(mnemonic, "subi") ||
       !strcmp(mnemonic, "muli") || !strcmp(mnemonic, "divi") || !strcmp(mnemonic, "modi"))
@@ -118,6 +107,35 @@ static char *address_comment(char *line) {
   return comment;
 }
 
+// Generated code is collected as a list of lines, so that the peephole
+// optimizer (see below) can work on it before it is printed.
+typedef enum { LINE_INSN, LINE_LABEL, LINE_COMMENT } LineKind;
+
+typedef struct {
+  LineKind kind;
+  char *text;    // label name or comment text (for instructions, see below)
+  char *comment; // a comment written with the instruction, or NULL
+
+  // Instruction
+  char *op;
+  char *args[3];
+  int nargs;
+} Line;
+
+static Line *lines;
+static int nlines;
+static int lines_cap;
+
+static Line *push_line(LineKind kind) {
+  if (nlines == lines_cap) {
+    lines_cap = lines_cap ? lines_cap * 2 : 256;
+    lines = realloc(lines, sizeof(Line) * lines_cap);
+  }
+  Line *l = &lines[nlines++];
+  *l = (Line){.kind = kind};
+  return l;
+}
+
 static void emit(char *fmt, ...) {
   // Code after an unconditional jump is never executed.
   if (unreachable)
@@ -129,18 +147,24 @@ static void emit(char *fmt, ...) {
   vsnprintf(buf, sizeof(buf), fmt, ap);
   va_end(ap);
 
-  char *comment = address_comment(buf);
-  if (comment)
-    fprintf(out, "    %s ; %s\n", buf, comment);
-  else
-    fprintf(out, "    %s\n", buf);
+  Line *l = push_line(LINE_INSN);
+  char *comment = strstr(buf, " ; ");
+  if (comment) {
+    l->comment = strdup(comment + 3);
+    *comment = '\0';
+  }
 
-  if (!strncmp(fmt, "ret", 3) || !strncmp(fmt, "ja ", 3))
+  char *text = strdup(buf);
+  l->op = strtok(text, " ");
+  for (char *t = strtok(NULL, " "); t && l->nargs < 3; t = strtok(NULL, " "))
+    l->args[l->nargs++] = t;
+
+  if (!strcmp(l->op, "ret") || !strcmp(l->op, "ja"))
     unreachable = true;
 }
 
 static void emit_label(char *name) {
-  fprintf(out, "%s:\n", name);
+  push_line(LINE_LABEL)->text = name;
   unreachable = false;
 }
 
@@ -181,7 +205,7 @@ static void emit_source_line(Token *tok) {
   while (end > start && isspace(end[-1]))
     end--;
 
-  fprintf(out, "    ; %.*s\n", (int)(end - start), start);
+  push_line(LINE_COMMENT)->text = format("%.*s", (int)(end - start), start);
 }
 
 static noreturn void unsupported(Node *node, char *what) {
@@ -279,21 +303,69 @@ static void free_op(Operand op) {
     temp_used[op.temp] = false;
 }
 
+// The constant pool: each constant that is needed in a slot gets a slot
+// of its own, set once at startup by the entry stub. Instructions then
+// use it like a variable. Without the pool, a constant is loaded into a
+// temporary (`ldi`) every time, and arithmetic uses the pseudo-
+// instructions addi, muli, ..., which expand to two primitives.
+typedef struct {
+  char *name;  // define name, e.g. __k32
+  char *value; // the value as text, a number or a define name
+  int addr;
+} PoolEntry;
+
+static PoolEntry *pool;
+static int npool;
+static HashMap pool_names; // value text -> index + 1
+
+static char *pool_slot(int32_t val, char *sym) {
+  char *value = sym ? sym : format("%d", val);
+  int i = (int)(intptr_t)hashmap_get(&pool_names, value) - 1;
+  if (i >= 0)
+    return pool[i].name;
+
+  char *name;
+  if (sym)
+    name = format("__k_%s", sym);
+  else if (val < 0)
+    name = format("__km%lld", -(long long)val);
+  else
+    name = format("__k%d", val);
+
+  pool = realloc(pool, sizeof(PoolEntry) * (npool + 1));
+  pool[npool] = (PoolEntry){name, value};
+  hashmap_put(&pool_names, value, (void *)(intptr_t)(npool + 1));
+  npool++;
+  return name;
+}
+
 // Returns a slot that holds the value of `op`. The constants 0, 1 and -1
-// live in reserved slots. Other constants are loaded into a temporary.
+// live in reserved slots. Other constants come from the constant pool, or
+// are loaded into a temporary.
 static Operand to_slot(Operand op) {
   if (!op.is_imm)
     return op;
-  if (op.imm == 0)
+  if (op.imm == 0 && !op.sym)
     return slot(SLOT_ZERO);
-  if (op.imm == 1)
+  if (op.imm == 1 && !op.sym)
     return slot(SLOT_ONE);
-  if (op.imm == -1)
+  if (op.imm == -1 && !op.sym)
     return slot(SLOT_MINUS_ONE);
+  if (opt_const_pool)
+    return slot(pool_slot(op.imm, op.sym));
 
   Operand t = new_temp();
   emit("ldi %s %s", t.name, imm_text(op));
   return t;
+}
+
+// Emits `d = a op k` for op add, mul, div or mod.
+static void emit_imm_op(char *op, char *d, char *a, int32_t k) {
+  if (!opt_const_pool) {
+    emit("%si %s %s %d", op, d, a, k);
+    return;
+  }
+  emit("%s %s %s %s", op, d, a, to_slot(imm(k)).name);
 }
 
 // The destination of an operation: the caller's hint if there is one,
@@ -475,7 +547,7 @@ static Operand lval_ptr(LValue *lv) {
     if (!lv->borrowed)
       free_op(lv->ptr);
     Operand t = new_temp();
-    emit("addi %s %s %d", t.name, lv->ptr.name, lv->offset);
+    emit_imm_op("add", t.name, lv->ptr.name, lv->offset);
     lv->ptr = t;
     lv->offset = 0;
     lv->borrowed = false;
@@ -637,9 +709,107 @@ static Operand gen_var(Node *node) {
   return slot(var->asm_name);
 }
 
+// The address of slot `i` of an l-value, as an operand for rdi/sti.
+static Operand slot_addr(LValue *lv, int i) {
+  Operand p = lval_ptr(lv);
+  if (i == 0)
+    return p;
+  Operand t = new_temp();
+  emit_imm_op("add", t.name, p.name, i);
+  return t;
+}
+
+// The l-value of a struct or union expression.
+static LValue gen_struct_lval(Node *node) {
+  switch (node->kind) {
+  case ND_VAR:
+  case ND_DEREF:
+  case ND_MEMBER:
+    return gen_lval(node);
+  case ND_COMMA:
+    gen_void(node->lhs);
+    return gen_struct_lval(node->rhs);
+  case ND_ASSIGN:
+    // a = b = c
+    free_op(gen_expr(node, NULL));
+    return gen_struct_lval(node->lhs);
+  }
+  unsupported(node, "struct and union values other than variables and"
+              " dereferences");
+}
+
+// Copies a struct or union slot by slot.
+static Operand gen_struct_assign(Node *node) {
+  int size = node->ty->size;
+  LValue dst = gen_lval(node->lhs);
+  LValue src = gen_struct_lval(node->rhs);
+
+  if (!dst.direct)
+    lval_ptr(&dst);
+  if (!src.direct)
+    lval_ptr(&src);
+
+  if ((dst.direct && src.direct) || size <= 8) {
+    for (int i = 0; i < size; i++) {
+      Operand v;
+      if (src.direct) {
+        LValue s = src;
+        s.addr += i;
+        v = slot(direct_name(&s));
+      } else {
+        Operand a = slot_addr(&src, i);
+        v = new_temp();
+        emit("rdi %s %s", v.name, a.name);
+        if (i)
+          free_op(a);
+      }
+
+      if (dst.direct) {
+        LValue d = dst;
+        d.addr += i;
+        move(slot(direct_name(&d)), v);
+      } else {
+        Operand a = slot_addr(&dst, i);
+        emit("sti %s %s", a.name, v.name);
+        if (i)
+          free_op(a);
+        free_op(v);
+      }
+    }
+  } else {
+    // A loop for large copies through pointers.
+    Operand p = new_temp(), q = new_temp(), end = new_temp(), v = new_temp();
+    if (src.direct)
+      emit("ldi %s %d", p.name, src.addr);
+    else
+      emit("cpy %s %s", p.name, src.ptr.name);
+    if (dst.direct)
+      emit("ldi %s %d", q.name, dst.addr);
+    else
+      emit("cpy %s %s", q.name, dst.ptr.name);
+    emit_imm_op("add", end.name, q.name, size);
+
+    char *loop = new_label("copy");
+    emit_label(loop);
+    emit("rdi %s %s", v.name, p.name);
+    emit("sti %s %s", q.name, v.name);
+    emit("inc %s", p.name);
+    emit("inc %s", q.name);
+    emit("jnea %s %s %s", loop, q.name, end.name);
+    free_op(p);
+    free_op(q);
+    free_op(end);
+    free_op(v);
+  }
+
+  free_lval(&dst);
+  free_lval(&src);
+  return imm(0);
+}
+
 static Operand gen_assign(Node *node, Operand *hint) {
   if (node->ty->kind == TY_STRUCT || node->ty->kind == TY_UNION)
-    unsupported(node, "struct and union assignments");
+    return gen_struct_assign(node);
 
   LValue lv = gen_lval(node->lhs);
   if (lv.direct) {
@@ -670,11 +840,64 @@ static Operand gen_compound_assign(Node *node, Operand *hint) {
   return r;
 }
 
-// Clears a local array or struct before its initializer runs.
-static void gen_memzero(Obj *var) {
+static bool refers_to(Node *node, Obj *var) {
+  if (!node)
+    return false;
+  if (node->kind == ND_VAR && node->var == var)
+    return true;
+  if (refers_to(node->lhs, var) || refers_to(node->rhs, var) ||
+      refers_to(node->cond, var) || refers_to(node->then, var) ||
+      refers_to(node->els, var) || refers_to(node->init, var) ||
+      refers_to(node->inc, var))
+    return true;
+  for (Node *n = node->body; n; n = n->next)
+    if (refers_to(n, var))
+      return true;
+  for (Node *n = node->args; n; n = n->next)
+    if (refers_to(n, var))
+      return true;
+  return false;
+}
+
+// Marks the slots of `var` that the initializer `node` assigns. Returns
+// false if the initializer could observe the slots before they are
+// assigned, because it calls a function or reads `var`.
+static bool init_covers(Node *node, Obj *var, bool *covered) {
+  switch (node->kind) {
+  case ND_NULL_EXPR:
+    return true;
+  case ND_COMMA:
+    return init_covers(node->lhs, var, covered) && init_covers(node->rhs, var, covered);
+  case ND_ASSIGN: {
+    LValue lv;
+    if (!node->is_init || !const_lval(node->lhs, &lv))
+      return false;
+    if (has_call(node->rhs) || refers_to(node->rhs, var))
+      return false;
+    for (int i = 0; i < node->ty->size; i++)
+      covered[lv.addr - var->addr + i] = true;
+    return true;
+  }
+  }
+  return false;
+}
+
+// Clears a local array or struct before its initializer runs, except
+// for the slots in `covered`, which the initializer assigns anyway.
+static void gen_memzero(Obj *var, bool *covered) {
   int size = var->ty->size;
-  if (size <= 32) {
-    for (int i = 0; i < size; i++) {
+  int first = 0, last = size, n = 0;
+  while (first < size && covered[first])
+    first++;
+  while (last > first && covered[last - 1])
+    last--;
+  for (int i = first; i < last; i++)
+    n += !covered[i];
+
+  if (n <= 32) {
+    for (int i = first; i < last; i++) {
+      if (covered[i])
+        continue;
       LValue lv = {.direct = true, .addr = var->addr + i, .var = var};
       emit("ldi %s 0", direct_name(&lv));
     }
@@ -684,8 +907,8 @@ static void gen_memzero(Obj *var) {
   char *loop = new_label("zero");
   Operand p = new_temp();
   Operand end = new_temp();
-  emit("ldi %s %s", p.name, var->asm_name);
-  emit("ldi %s %d", end.name, var->addr + size);
+  emit("ldi %s %d", p.name, var->addr + first);
+  emit("ldi %s %d", end.name, var->addr + last);
   emit_label(loop);
   emit("sti %s %s", p.name, SLOT_ZERO);
   emit("inc %s", p.name);
@@ -751,10 +974,10 @@ static Operand gen_arith(Node *node, Operand *hint) {
         emit("inc %s", d.name);
       else if (same_slot(d, a) && k == -1)
         emit("dec %s", d.name);
-      else if (k < 0 && k != INT32_MIN)
+      else if (k < 0 && k != INT32_MIN && !opt_const_pool)
         emit("subi %s %s %d", d.name, a.name, -k);
       else
-        emit("addi %s %s %d", d.name, a.name, k);
+        emit_imm_op("add", d.name, a.name, k);
       return d;
     case ND_MUL:
       if (k == 0) {
@@ -768,7 +991,7 @@ static Operand gen_arith(Node *node, Operand *hint) {
       if (k == -1)
         emit("sub %s %s %s", d.name, SLOT_ZERO, a.name);
       else
-        emit("muli %s %s %d", d.name, a.name, k);
+        emit_imm_op("mul", d.name, a.name, k);
       return d;
     case ND_DIV:
       if (k == 0)
@@ -780,7 +1003,7 @@ static Operand gen_arith(Node *node, Operand *hint) {
       if (k == -1)
         emit("sub %s %s %s", d.name, SLOT_ZERO, a.name);
       else
-        emit("divi %s %s %d", d.name, a.name, k);
+        emit_imm_op("div", d.name, a.name, k);
       return d;
     case ND_MOD:
       if (k == 0)
@@ -789,7 +1012,7 @@ static Operand gen_arith(Node *node, Operand *hint) {
       if (k == 1 || k == -1)
         return imm(0);
       d = dest(hint);
-      emit("modi %s %s %d", d.name, a.name, k);
+      emit_imm_op("mod", d.name, a.name, k);
       return d;
     }
   }
@@ -838,12 +1061,12 @@ static Operand gen_compare(Node *node, Operand *hint) {
   emit("cmp %s %s %s", d.name, a.name, b.name);
   switch (node->kind) {
   case ND_LT: // (cmp + 1) / 2 maps 1, 0, -1 to 1, 0, 0
-    emit("addi %s %s 1", d.name, d.name);
-    emit("divi %s %s 2", d.name, d.name);
+    emit("inc %s", d.name);
+    emit_imm_op("div", d.name, d.name, 2);
     break;
   case ND_LE: // (cmp + 2) / 2 maps 1, 0, -1 to 1, 1, 0
-    emit("addi %s %s 2", d.name, d.name);
-    emit("divi %s %s 2", d.name, d.name);
+    emit_imm_op("add", d.name, d.name, 2);
+    emit_imm_op("div", d.name, d.name, 2);
     break;
   case ND_EQ: // 1 - cmp^2
     emit("mul %s %s %s", d.name, d.name, d.name);
@@ -1012,17 +1235,17 @@ static Operand gen_bitwise(Node *node, Operand *hint) {
     free_op(a);
     d = dest(hint);
     if (node->kind == ND_SHL && k <= 30) {
-      emit("muli %s %s %d", d.name, a.name, 1 << k);
+      emit_imm_op("mul", d.name, a.name, 1 << k);
     } else if (node->kind == ND_SHL) {
       // x << 31 keeps only the lowest bit, which becomes the sign bit.
-      emit("modi %s %s 2", d.name, a.name);
-      emit("muli %s %s -2147483648", d.name, d.name);
+      emit_imm_op("mod", d.name, a.name, 2);
+      emit_imm_op("mul", d.name, d.name, INT32_MIN);
     } else if (k <= 30) {
-      emit("divi %s %s %d", d.name, a.name, 1 << k);
+      emit_imm_op("div", d.name, a.name, 1 << k);
     } else {
       // 2^31 isn't representable, so divide twice.
-      emit("divi %s %s 1073741824", d.name, a.name);
-      emit("divi %s %s 2", d.name, d.name);
+      emit_imm_op("div", d.name, a.name, 1 << 30);
+      emit_imm_op("div", d.name, d.name, 2);
     }
     return d;
   case ND_BITAND:
@@ -1035,10 +1258,10 @@ static Operand gen_bitwise(Node *node, Operand *hint) {
     free_op(a);
     d = dest(hint);
     if (k > 0) {
-      emit("modi %s %s %d", d.name, a.name, k + 1);
+      emit_imm_op("mod", d.name, a.name, k + 1);
     } else {
-      emit("divi %s %s %d", d.name, a.name, -k);
-      emit("muli %s %s %d", d.name, d.name, -k);
+      emit_imm_op("div", d.name, a.name, -k);
+      emit_imm_op("mul", d.name, d.name, -k);
     }
     return d;
   case ND_BITOR:
@@ -1293,6 +1516,14 @@ static Operand gen_expr(Node *node, Operand *hint) {
   case ND_COMMA:
     if (is_compound_assign(node->lhs))
       return gen_compound_assign(node, hint);
+    if (node->lhs->kind == ND_MEMZERO) {
+      Obj *var = node->lhs->var;
+      bool *covered = calloc(var->ty->size, sizeof(bool));
+      if (!init_covers(node->rhs, var, covered))
+        memset(covered, 0, var->ty->size * sizeof(bool));
+      gen_memzero(var, covered);
+      return gen_expr(node->rhs, hint);
+    }
     gen_void(node->lhs);
     return gen_expr(node->rhs, hint);
   case ND_ASSIGN:
@@ -1311,7 +1542,7 @@ static Operand gen_expr(Node *node, Operand *hint) {
     return imm(0);
   }
   case ND_MEMZERO:
-    gen_memzero(node->var);
+    gen_memzero(node->var, calloc(node->var->ty->size, sizeof(bool)));
     return imm(0);
   case ND_ADD:
   case ND_SUB:
@@ -1366,6 +1597,34 @@ static Operand gen_expr(Node *node, Operand *hint) {
 //
 // Conditions
 //
+
+// Returns true if the value of `node` is always 0 or 1. Testing such a
+// value for false takes one jump (x != 1) instead of two (x == 0).
+static bool is_zero_or_one(Node *node) {
+  int64_t k;
+  switch (node->kind) {
+  case ND_VAR:
+  case ND_DEREF:
+  case ND_MEMBER:
+  case ND_CAST:
+    return node->ty->kind == TY_BOOL;
+  case ND_MOD:
+    // x % 2 is 0 or 1 even for negative x, because g2's mod takes the
+    // sign of the divisor.
+    return const_int(node->rhs, &k) && k == 2;
+  case ND_BITAND:
+    return (const_int(node->rhs, &k) && k == 1) || (const_int(node->lhs, &k) && k == 1);
+  case ND_EQ:
+  case ND_NE:
+  case ND_LT:
+  case ND_LE:
+  case ND_NOT:
+  case ND_LOGAND:
+  case ND_LOGOR:
+    return true;
+  }
+  return false;
+}
 
 // Jumps to `target` if `a == b`. g2 only has "jump if not equal", so this
 // jumps over an unconditional jump instead.
@@ -1428,6 +1687,29 @@ static void gen_cond(Node *node, bool jump_if, char *target) {
         emit("ja %s", target);
       return;
     }
+    // `cmp` gives 1, 0 or -1. "a < b" (cmp == 1) can only be tested
+    // directly for false, and "a <= b" (cmp != -1) only for true; the
+    // other direction needs two jumps. Against a constant, pick the form
+    // that suits the jump: a < k is a <= k - 1, and a <= k is a < k + 1.
+    NodeKind kind = node->kind;
+    if (kind == ND_LT && jump_if) {
+      if (b.is_imm && !b.sym && b.imm != INT32_MIN) {
+        b = imm(b.imm - 1);
+        kind = ND_LE;
+      } else if (a.is_imm && !a.sym && a.imm != INT32_MAX) {
+        a = imm(a.imm + 1);
+        kind = ND_LE;
+      }
+    } else if (kind == ND_LE && !jump_if) {
+      if (b.is_imm && !b.sym && b.imm != INT32_MAX) {
+        b = imm(b.imm + 1);
+        kind = ND_LT;
+      } else if (a.is_imm && !a.sym && a.imm != INT32_MIN) {
+        a = imm(a.imm - 1);
+        kind = ND_LT;
+      }
+    }
+
     a = to_slot(a);
     b = to_slot(b);
     free_op(a);
@@ -1445,7 +1727,7 @@ static void gen_cond(Node *node, bool jump_if, char *target) {
     emit("cmp %s %s %s", t.name, a.name, b.name);
     free_op(t);
 
-    if (node->kind == ND_LT) {
+    if (kind == ND_LT) {
       // a < b iff cmp == 1
       if (jump_if)
         jump_if_equal(target, t, slot(SLOT_ONE));
@@ -1471,6 +1753,8 @@ static void gen_cond(Node *node, bool jump_if, char *target) {
   free_op(x);
   if (jump_if)
     emit("jnea %s %s %s", target, x.name, SLOT_ZERO);
+  else if (is_zero_or_one(node))
+    emit("jnea %s %s %s", target, x.name, SLOT_ONE); // false iff x != 1
   else
     jump_if_equal(target, x, slot(SLOT_ZERO));
 }
@@ -1500,20 +1784,26 @@ static void gen_stmt(Node *node) {
     return;
   }
   case ND_FOR: {
+    // The condition is tested at the bottom, so each iteration takes one
+    // conditional jump instead of a conditional and an unconditional one.
     emit_source_line(node->tok);
-    char *loop = new_label("loop");
-    char *brk = chibicc_label(node->brk_label);
+    char *body = new_label("loop");
+    char *cond = new_label("cond");
     if (node->init)
       gen_stmt(node->init);
-    emit_label(loop);
     if (node->cond)
-      gen_cond(node->cond, false, brk);
+      emit("ja %s", cond);
+    emit_label(body);
     gen_stmt(node->then);
     emit_label(chibicc_label(node->cont_label));
     if (node->inc)
       gen_void(node->inc);
-    emit("ja %s", loop);
-    emit_label(brk);
+    emit_label(cond);
+    if (node->cond)
+      gen_cond(node->cond, true, body);
+    else
+      emit("ja %s", body);
+    emit_label(chibicc_label(node->brk_label));
     return;
   }
   case ND_DO: {
@@ -1609,6 +1899,355 @@ static void gen_stmt(Node *node) {
 }
 
 //
+// Peephole optimizer
+//
+// Works on the lines of one function. Most rules only concern
+// temporaries (t_*), which are local to the function and never have
+// their address taken, so their liveness can be computed exactly.
+
+static bool is_insn(Line *l, char *op) {
+  return l->kind == LINE_INSN && !strcmp(l->op, op);
+}
+
+static bool is_jump(Line *l) {
+  return is_insn(l, "ja") || is_insn(l, "jnea");
+}
+
+static bool is_temp(char *name) {
+  return !strncmp(name, "t_", 2);
+}
+
+// Labels that other code (the entry stub, calls) refers to.
+static bool is_protected_label(char *name) {
+  return !strncmp(name, "fn_", 3) || !strncmp(name, "__g2_", 5);
+}
+
+// Which operands an instruction reads and writes, as bit masks.
+static void operand_use(Line *l, int *reads, int *writes) {
+  char *op = l->op;
+  *reads = *writes = 0;
+  if (!strcmp(op, "ldi")) {
+    *writes = 1;
+  } else if (!strcmp(op, "rdi") || !strcmp(op, "cpy") || !strcmp(op, "addi") ||
+             !strcmp(op, "subi") || !strcmp(op, "muli") || !strcmp(op, "divi") ||
+             !strcmp(op, "modi")) {
+    *writes = 1;
+    *reads = 2;
+  } else if (!strcmp(op, "add") || !strcmp(op, "sub") || !strcmp(op, "mul") ||
+             !strcmp(op, "div") || !strcmp(op, "mod") || !strcmp(op, "cmp")) {
+    *writes = 1;
+    *reads = 6;
+  } else if (!strcmp(op, "inc") || !strcmp(op, "dec")) {
+    *writes = 1;
+    *reads = 1;
+  } else if (!strcmp(op, "jnea")) {
+    *reads = 6;
+  } else if (!strcmp(op, "ja") || !strcmp(op, "call") || !strcmp(op, "ret")) {
+    // no slot operands
+  } else {
+    // sti, col, pix: all operands are read
+    *reads = (1 << l->nargs) - 1;
+  }
+}
+
+static bool reads_operand(Line *l, int i) {
+  int r, w;
+  operand_use(l, &r, &w);
+  return r & (1 << i);
+}
+
+// A "pure" write only writes its first operand, without reading it.
+static bool is_pure_write(Line *l) {
+  int r, w;
+  operand_use(l, &r, &w);
+  return w == 1 && !(r & 1);
+}
+
+static bool reads_slot(Line *l, char *name) {
+  for (int i = 0; i < l->nargs; i++)
+    if (reads_operand(l, i) && !strcmp(l->args[i], name))
+      return true;
+  return false;
+}
+
+static int find_label(char *name) {
+  for (int i = 0; i < nlines; i++)
+    if (lines[i].kind == LINE_LABEL && !strcmp(lines[i].text, name))
+      return i;
+  return -1;
+}
+
+// The first instruction at or after line i, or -1.
+static int next_insn(int i) {
+  for (; i < nlines; i++)
+    if (lines[i].kind == LINE_INSN)
+      return i;
+  return -1;
+}
+
+static void delete_line(int i) {
+  memmove(&lines[i], &lines[i + 1], sizeof(Line) * (nlines - i - 1));
+  nlines--;
+}
+
+// Liveness of temporaries. live_out[i] is a bit set over temporary
+// indexes, for instruction line i.
+typedef struct {
+  int ntemps;
+  int words;
+  uint64_t *live_out;
+  HashMap index; // temp name -> index + 1
+} Liveness;
+
+static int temp_index(Liveness *lv, char *name) {
+  return (int)(intptr_t)hashmap_get(&lv->index, name) - 1;
+}
+
+static void set_bit(uint64_t *set, int i) { set[i / 64] |= 1ull << (i % 64); }
+static void clear_bit(uint64_t *set, int i) { set[i / 64] &= ~(1ull << (i % 64)); }
+static bool test_bit(uint64_t *set, int i) { return set[i / 64] & (1ull << (i % 64)); }
+
+static void compute_liveness(Liveness *lv) {
+  *lv = (Liveness){};
+  for (int i = 0; i < nlines; i++) {
+    if (lines[i].kind != LINE_INSN)
+      continue;
+    for (int j = 0; j < lines[i].nargs; j++) {
+      char *a = lines[i].args[j];
+      if (is_temp(a) && !hashmap_get(&lv->index, a))
+        hashmap_put(&lv->index, a, (void *)(intptr_t)(++lv->ntemps));
+    }
+  }
+  lv->words = (lv->ntemps + 63) / 64 + 1;
+
+  uint64_t *live_in = calloc(nlines * lv->words, sizeof(uint64_t));
+  lv->live_out = calloc(nlines * lv->words, sizeof(uint64_t));
+  int *target = calloc(nlines, sizeof(int));
+  for (int i = 0; i < nlines; i++)
+    if (is_jump(&lines[i]))
+      target[i] = next_insn(find_label(lines[i].args[0]));
+
+  for (bool changed = true; changed;) {
+    changed = false;
+    for (int i = nlines - 1; i >= 0; i--) {
+      Line *l = &lines[i];
+      if (l->kind != LINE_INSN)
+        continue;
+      uint64_t *out = &lv->live_out[i * lv->words];
+      uint64_t *in = &live_in[i * lv->words];
+
+      // Successors: the next instruction unless the flow stops here, and
+      // the target of a jump.
+      uint64_t tmp[lv->words];
+      memset(tmp, 0, sizeof(tmp));
+      if (!is_insn(l, "ja") && !is_insn(l, "ret")) {
+        int n = next_insn(i + 1);
+        if (n >= 0)
+          for (int w = 0; w < lv->words; w++)
+            tmp[w] |= live_in[n * lv->words + w];
+      }
+      if (is_jump(l) && target[i] >= 0)
+        for (int w = 0; w < lv->words; w++)
+          tmp[w] |= live_in[target[i] * lv->words + w];
+      memcpy(out, tmp, sizeof(tmp));
+
+      int r, wr;
+      operand_use(l, &r, &wr);
+      for (int j = 0; j < l->nargs; j++)
+        if ((wr & (1 << j)) && is_temp(l->args[j]))
+          clear_bit(tmp, temp_index(lv, l->args[j]));
+      for (int j = 0; j < l->nargs; j++)
+        if ((r & (1 << j)) && is_temp(l->args[j]))
+          set_bit(tmp, temp_index(lv, l->args[j]));
+
+      if (memcmp(in, tmp, sizeof(tmp))) {
+        memcpy(in, tmp, sizeof(tmp));
+        changed = true;
+      }
+    }
+  }
+}
+
+static bool live_after(Liveness *lv, int i, char *temp) {
+  return test_bit(&lv->live_out[i * lv->words], temp_index(lv, temp));
+}
+
+// The instruction right after line i, if no label is in between.
+static int adjacent_insn(int i) {
+  for (int j = i + 1; j < nlines; j++) {
+    if (lines[j].kind == LINE_LABEL)
+      return -1;
+    if (lines[j].kind == LINE_INSN)
+      return j;
+  }
+  return -1;
+}
+
+static bool peephole_pass(void) {
+  bool changed = false;
+
+  // Unreachable code after an unconditional jump or return.
+  for (int i = 0; i < nlines; i++) {
+    if (!is_insn(&lines[i], "ja") && !is_insn(&lines[i], "ret"))
+      continue;
+    while (i + 1 < nlines && lines[i + 1].kind != LINE_LABEL) {
+      delete_line(i + 1);
+      changed = true;
+    }
+  }
+
+  // Jumps to the next instruction.
+  for (int i = 0; i < nlines; i++) {
+    if (!is_jump(&lines[i]))
+      continue;
+    int j = i + 1;
+    bool next = false;
+    for (; j < nlines && lines[j].kind != LINE_INSN; j++)
+      if (lines[j].kind == LINE_LABEL && !strcmp(lines[j].text, lines[i].args[0]))
+        next = true;
+    if (next) {
+      delete_line(i--);
+      changed = true;
+    }
+  }
+
+  // Jumps to a jump or a return.
+  for (int i = 0; i < nlines; i++) {
+    if (!is_jump(&lines[i]))
+      continue;
+    for (int hops = 0; hops < 16; hops++) {
+      int t = next_insn(find_label(lines[i].args[0]) + 1);
+      if (t < 0)
+        break;
+      if (is_insn(&lines[t], "ja") && strcmp(lines[t].args[0], lines[i].args[0])) {
+        lines[i].args[0] = lines[t].args[0];
+        changed = true;
+        continue;
+      }
+      if (is_insn(&lines[i], "ja") && is_insn(&lines[t], "ret")) {
+        lines[i].op = "ret";
+        lines[i].nargs = 0;
+        changed = true;
+      }
+      break;
+    }
+  }
+
+  // Labels that nothing jumps to.
+  for (int i = 0; i < nlines; i++) {
+    if (lines[i].kind != LINE_LABEL || is_protected_label(lines[i].text))
+      continue;
+    bool used = false;
+    for (int j = 0; j < nlines && !used; j++)
+      used = is_jump(&lines[j]) && !strcmp(lines[j].args[0], lines[i].text);
+    if (!used) {
+      delete_line(i--);
+      changed = true;
+    }
+  }
+
+  // Copies of a slot to itself.
+  for (int i = 0; i < nlines; i++) {
+    if (is_insn(&lines[i], "cpy") && !strcmp(lines[i].args[0], lines[i].args[1])) {
+      delete_line(i--);
+      changed = true;
+    }
+  }
+
+  // Rules that need the liveness of temporaries. Each rewrite only
+  // changes the instructions it looks at, so several can be done with
+  // the same liveness information as long as they don't overlap.
+  Liveness lv;
+  compute_liveness(&lv);
+  bool *dead = calloc(nlines, sizeof(bool));
+  bool *touched = calloc(nlines, sizeof(bool));
+
+  for (int i = 0; i < nlines; i++) {
+    Line *l = &lines[i];
+    if (l->kind != LINE_INSN || touched[i])
+      continue;
+
+    int r, w;
+    operand_use(l, &r, &w);
+    char *dst = (w & 1) ? l->args[0] : NULL;
+
+    // A temporary that is written but never read.
+    if (dst && is_temp(dst) && !live_after(&lv, i, dst)) {
+      dead[i] = touched[i] = true;
+      continue;
+    }
+
+    int j = adjacent_insn(i);
+    if (j < 0 || touched[j])
+      continue;
+    Line *next = &lines[j];
+
+    // `op t, ...; cpy y, t` -> `op y, ...` if t isn't used afterwards
+    if (dst && is_temp(dst) && is_pure_write(l) && is_insn(next, "cpy") &&
+        !strcmp(next->args[1], dst) && strcmp(next->args[0], dst) &&
+        !live_after(&lv, j, dst)) {
+      l->args[0] = next->args[0];
+      dead[j] = true;
+      touched[i] = touched[j] = true;
+      continue;
+    }
+
+    // `cpy t, x; op ..., t, ...` -> `op ..., x, ...` if t isn't used afterwards
+    if (is_insn(l, "cpy") && is_temp(dst) && reads_slot(next, dst) &&
+        !live_after(&lv, j, dst)) {
+      int nr, nw;
+      operand_use(next, &nr, &nw);
+      if (!((nw & 1) && !strcmp(next->args[0], dst))) {
+        for (int k = 0; k < next->nargs; k++)
+          if ((nr & (1 << k)) && !strcmp(next->args[k], dst))
+            next->args[k] = l->args[1];
+        dead[i] = true;
+        touched[i] = touched[j] = true;
+        continue;
+      }
+    }
+  }
+
+  for (int i = nlines - 1; i >= 0; i--) {
+    if (dead[i]) {
+      delete_line(i);
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+static void peephole(void) {
+  if (!opt_peephole)
+    return;
+  while (peephole_pass())
+    ;
+}
+
+// Prints the collected lines.
+static void print_lines(FILE *o) {
+  for (int i = 0; i < nlines; i++) {
+    Line *l = &lines[i];
+    if (l->kind == LINE_LABEL) {
+      fprintf(o, "%s:\n", l->text);
+      continue;
+    }
+    if (l->kind == LINE_COMMENT) {
+      fprintf(o, "    ; %s\n", l->text);
+      continue;
+    }
+
+    fprintf(o, "    %s", l->op);
+    for (int j = 0; j < l->nargs; j++)
+      fprintf(o, " %s", l->args[j]);
+    char *comment = l->comment ? l->comment : address_comment(l->op, l->args, l->nargs);
+    if (comment)
+      fprintf(o, " ; %s", comment);
+    fprintf(o, "\n");
+  }
+}
+
+//
 // Program
 //
 
@@ -1656,29 +2295,67 @@ static void name_frame(Obj *fn) {
   }
 }
 
+// Assigns addresses to the parameters and locals of a function. With
+// overlaying, locals of sibling block scopes share memory: a scope's
+// variables are placed after those of all enclosing scopes, and sibling
+// scopes start at the same offset.
+static void layout_locals(FnInfo *info) {
+  Obj *fn = info->fn;
+  int n;
+  Obj **vars = frame_vars(fn, &n);
+
+  if (!opt_overlay) {
+    int offset = 0;
+    for (int i = 0; i < n; i++) {
+      vars[i]->addr = info->base + offset;
+      offset += vars[i]->ty->size;
+    }
+    info->nlocals = offset;
+    return;
+  }
+
+  int ns = fn->nscopes;
+  int *size = calloc(ns, sizeof(int));
+  int *start = calloc(ns, sizeof(int));
+  int *next = calloc(ns, sizeof(int));
+  for (int i = 0; i < n; i++)
+    size[vars[i]->scope] += vars[i]->ty->size;
+
+  // A parent scope always has a smaller index than its children.
+  info->nlocals = 0;
+  for (int i = 0; i < ns; i++) {
+    int parent = fn->scope_parents[i];
+    start[i] = next[i] = (parent < 0) ? 0 : start[parent] + size[parent];
+    info->nlocals = MAX(info->nlocals, start[i] + size[i]);
+  }
+
+  for (int i = 0; i < n; i++) {
+    vars[i]->addr = info->base + next[vars[i]->scope];
+    next[vars[i]->scope] += vars[i]->ty->size;
+  }
+}
+
 static void gen_function(FnInfo *info, int base) {
   Obj *fn = info->fn;
   current = info;
   info->base = base;
-
-  int n;
-  Obj **vars = frame_vars(fn, &n);
-  int offset = 0;
-  for (int i = 0; i < n; i++) {
-    vars[i]->addr = base + offset;
-    offset += vars[i]->ty->size;
-  }
-  info->nlocals = offset;
+  info->ntemps = 0;
+  info->ncallees = 0;
+  layout_locals(info);
 
   if (temp_cap)
     memset(temp_used, 0, temp_cap * sizeof(bool));
   last_comment_file = NULL;
 
-  out = open_memstream(&info->code, &info->code_len);
+  nlines = 0;
   emit_label(fn->asm_name);
   gen_stmt(fn->body);
   emit("ret");
-  fclose(out);
+  peephole();
+
+  FILE *o = open_memstream(&info->code, &info->code_len);
+  print_lines(o);
+  fclose(o);
 }
 
 // Reports recursion (a cycle in the call graph) and computes the longest
@@ -1938,6 +2615,10 @@ void codegen(Obj *prog, int width, int height, FILE *outfile) {
     if (fns[i]->fn != start && fns[i]->fn != tick)
       order[norder++] = fns[i];
 
+  // First pass: frames laid out one after another. This gives the size
+  // of every frame and the call graph.
+  int frames_begin = addr;
+  int saved_label_count = label_count;
   for (int i = 0; i < norder; i++) {
     gen_function(order[i], addr);
     addr += order[i]->nlocals + order[i]->ntemps;
@@ -1949,6 +2630,62 @@ void codegen(Obj *prog, int width, int height, FILE *outfile) {
   FnInfo **stack = calloc(nfns + 1, sizeof(FnInfo *));
   for (int i = 0; i < norder; i++)
     check_calls(order[i], stack, 0);
+
+  // Overlay frames. Functions that can't be active at the same time share
+  // memory: every frame is placed above the frames of all its callers,
+  // and start() and tick() (which the entry stub calls one after the
+  // other) both begin at the bottom. Local addresses are compiled into the
+  // code, so the functions are compiled again with their final addresses.
+  // If a frame comes out bigger than in the previous pass (temporaries
+  // can differ in rare cases), the layout is redone.
+  if (opt_overlay) {
+    int *planned = calloc(norder, sizeof(int));
+    for (int i = 0; i < norder; i++)
+      planned[i] = order[i]->nlocals + order[i]->ntemps;
+
+    for (int round = 0;; round++) {
+      if (round == 8)
+        error("internal error: frame layout doesn't converge");
+
+      int *base = calloc(norder, sizeof(int));
+      for (int i = 0; i < norder; i++)
+        base[i] = frames_begin;
+      for (bool changed = true; changed;) {
+        changed = false;
+        for (int i = 0; i < norder; i++) {
+          for (int j = 0; j < order[i]->ncallees; j++) {
+            int k = 0;
+            while (order[k] != order[i]->callees[j])
+              k++;
+            if (base[k] < base[i] + planned[i]) {
+              base[k] = base[i] + planned[i];
+              changed = true;
+            }
+          }
+        }
+      }
+
+      label_count = saved_label_count;
+      npool = 0;
+      pool_names = (HashMap){};
+      addr_comments = (HashMap){};
+      for (int i = 0; i < norder; i++)
+        gen_function(order[i], base[i]);
+
+      bool fits = true;
+      addr = frames_begin;
+      for (int i = 0; i < norder; i++) {
+        int size = order[i]->nlocals + order[i]->ntemps;
+        if (size > planned[i]) {
+          planned[i] = size;
+          fits = false;
+        }
+        addr = MAX(addr, base[i] + planned[i]);
+      }
+      if (fits)
+        break;
+    }
+  }
   for (int i = 0; i < norder; i++) {
     FnInfo *root = order[i];
     if (root->fn != start && root->fn != tick)
@@ -1956,6 +2693,15 @@ void codegen(Obj *prog, int width, int height, FILE *outfile) {
     if (root->depth + 1 > CALL_STACK_SIZE)
       error("call depth %d exceeds the g2 call stack (%d): %s", root->depth + 1,
             CALL_STACK_SIZE, call_chain(root));
+  }
+
+  // The constant pool goes after the frames.
+  for (int i = 0; i < npool; i++)
+    pool[i].addr = addr++;
+  if (npool && !has_once) {
+    has_once = true;
+    started_flag = unique_asm_name("__g2_started");
+    started_addr = addr++;
   }
 
   int memory = addr;
@@ -2036,18 +2782,24 @@ void codegen(Obj *prog, int width, int height, FILE *outfile) {
               info->base + info->nlocals + j);
   }
 
+  if (npool) {
+    fprintf(o, "\n; ---- constant pool ----\n");
+    for (int i = 0; i < npool; i++)
+      fprintf(o, "define %s %d\n", pool[i].name, pool[i].addr);
+  }
+
   // Entry stub. The VM runs the program from instruction 0 every frame.
   // On the first frame, the stub initializes globals and calls start().
   fprintf(o, "\n; ---- entry stub: runs every frame from instruction 0 ----\n");
-  char *buf;
-  size_t buflen;
-  out = open_memstream(&buf, &buflen);
+  nlines = 0;
   unreachable = false;
   if (has_once) {
     emit("jnea __g2_entry_first %s 1", started_flag);
     emit("ja __g2_entry_tick");
     emit_label("__g2_entry_first");
     emit("ldi %s 1", started_flag);
+    for (int i = 0; i < npool; i++)
+      emit("ldi %s %s", pool[i].name, pool[i].value);
     emit_global_init(globals, nglobals);
     if (start)
       emit("call %s", start->asm_name);
@@ -2056,8 +2808,7 @@ void codegen(Obj *prog, int width, int height, FILE *outfile) {
   if (tick)
     emit("call %s", tick->asm_name);
   emit("ja __g2_end");
-  fclose(out);
-  fwrite(buf, buflen, 1, o);
+  print_lines(o);
 
   for (int i = 0; i < norder; i++) {
     fprintf(o, "\n");

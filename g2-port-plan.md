@@ -168,14 +168,14 @@ Updated `example/g2.h` using these attributes:
 void color(int r, int g, int b) __attribute__((g2_intrinsic("col")));
 void pix(int x, int y)          __attribute__((g2_intrinsic("pix")));
 
-extern const int CONTROL1 __attribute__((address(3)));
-extern const int CONTROL2 __attribute__((address(4)));
-extern const int A        __attribute__((address(5)));
-extern const int B        __attribute__((address(6)));
-extern const int UP       __attribute__((address(7)));
-extern const int DOWN     __attribute__((address(8)));
-extern const int LEFT     __attribute__((address(9)));
-extern const int RIGHT    __attribute__((address(10)));
+extern const _Bool CONTROL1 __attribute__((address(3)));
+extern const _Bool CONTROL2 __attribute__((address(4)));
+extern const _Bool A        __attribute__((address(5)));
+extern const _Bool B        __attribute__((address(6)));
+extern const _Bool UP       __attribute__((address(7)));
+extern const _Bool DOWN     __attribute__((address(8)));
+extern const _Bool LEFT     __attribute__((address(9)));
+extern const _Bool RIGHT    __attribute__((address(10)));
 extern const int DELTA    __attribute__((address(11)));
 
 // Loaded data (§4.4). Editors and other tools see a plain declaration.
@@ -1017,6 +1017,42 @@ edges. Notes:
    ones, and struct assignment. Struct pass/return by value stays rejected, or gets lowered to a hidden
    pointer.
 5. Optionally, initialised data emitted as `load` statements (data placement is now known; see §6.9).
+
+*Status:* items 1–4 are done. Item 5 is skipped for now: the only `load` data type that could carry
+arbitrary values is `bytes`, which the assembler can't parse yet (§13). Each optimization can be
+turned off: `-fno-peephole`, `-fno-const-pool`, `-fno-overlay`. `make test` passes in every
+combination (`tools/run_tests.py --cflags=...`). Results:
+
+| | Baseline (end of Phase 3) | Phase 4 |
+|---|---|---|
+| snake: instructions executed per frame (300-frame run) | 1866 | 1389 (−26%) |
+| snake: program size (primitive instructions) | 457 | 426 |
+| snake: memory, excluding loaded data | 238 slots | 221 slots |
+| move_pixel: instructions executed per frame | 49.7 | 40.7 |
+
+What was done, and where it differs from the plan:
+
+- **Peephole (§6.10).** Each function's code goes into a list of lines before it is printed. The
+  pass removes jumps to the next line, retargets jumps to jumps (and `ja` to a `ret` becomes `ret`),
+  and removes unused labels, unreachable code and `cpy x x`. Liveness of temporaries is computed over
+  the control-flow graph, which enables three more rewrites: `op t …; cpy y t` → `op y …`, folding
+  single-use copies into the instruction that reads them, and deleting writes to dead temporaries.
+- **Constant pool.** Each constant needed in a slot gets a pool slot, `__k<n>` (`__km<n>` for
+  negatives), set by the entry stub. Arithmetic with a constant uses the pool too, so `x + 10` is one
+  `add` instead of `addi`, which expands to two primitives.
+- **Conditions.** `for` and `while` loops test at the bottom. Against a constant, `<` and `<=` are
+  swapped (`i < 32` ⇔ `i <= 31`) so that the jump takes a single `jnea` in either direction.
+  Testing a value that is always 0 or 1 for false (`x % 2`, `x & 1`, `_Bool`, comparisons) is one
+  jump instead of two. To benefit from this, `g2.h` now declares the keys as `const _Bool`.
+- **Overlay (§5.3).** Local addresses are compiled into the code, so functions are compiled twice:
+  once to learn frame sizes and the call graph, then again with the overlaid layout. If a frame
+  grows in the second pass, the layout is redone. Locals in sibling block scopes share slots; the
+  parser records each local's scope and each function's scope tree.
+- **Structs.** Struct and union assignment, including initialisation from another struct and
+  `a = b = c`, copies slot by slot. Large copies through pointers use a loop. Passing and returning
+  structs by value is still rejected.
+- **Zeroing.** An initialised local array or struct is no longer cleared in slots that its
+  initializer assigns, as long as the initializer makes no calls and doesn't read the variable.
 
 ### Phase 5: Optional extensions
 
