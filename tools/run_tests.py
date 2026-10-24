@@ -61,7 +61,7 @@ def main():
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     parser = argparse.ArgumentParser(description='Run the g2 test suite.')
     parser.add_argument('tests', nargs='*', help='test files (default: test-g2/*.c)')
-    parser.add_argument('--compiler', default=os.path.join(root, 'chibicc-g2'))
+    parser.add_argument('--compiler', default=os.path.join(root, 'build', 'chibicc-g2'))
     parser.add_argument('--assembler', default='g2a')
     parser.add_argument('--cflags', default='',
                         help='extra compiler flags, e.g. "-fno-overlay -fno-peephole"')
