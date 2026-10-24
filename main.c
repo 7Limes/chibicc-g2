@@ -45,10 +45,16 @@ static bool take_arg(char *arg) {
 }
 
 static void add_default_include_paths(char *argv0) {
-  // g2 headers are installed to ./include relative to argv[0]. Host
+  // g2 headers are installed to ./include relative to the executable. Host
   // system headers (/usr/include etc.) are deliberately not searched,
   // since they describe the host's C library, which doesn't exist on g2.
-  char *dir = format("%s/include", dirname(strdup(argv0)));
+  //
+  // argv[0] may be a bare name found through PATH or a symlink, so use
+  // the real path of the running executable when it is available.
+  char *exe = realpath("/proc/self/exe", NULL);
+  if (!exe)
+    exe = strdup(argv0);
+  char *dir = format("%s/include", dirname(exe));
   strarray_push(&include_paths, dir);
 
   // Keep a copy of the standard include paths for -MMD option.
