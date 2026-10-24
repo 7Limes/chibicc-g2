@@ -74,11 +74,49 @@ static int temp_cap;
 static HashMap asm_names;    // every emitted define or label name
 static HashMap global_names; // C name -> allocated global Obj
 
+// Numeric operands that address part of a variable, such as "45" for
+// arr[12], mapped to a description ("g_arr+12") for comments.
+static HashMap addr_comments;
+
 //
 // Output helpers
 //
 
 static void emit(char *fmt, ...) __attribute__((format(printf, 1, 2)));
+
+// Returns a comment naming the variables behind numeric address operands
+// in `line`, or NULL. Immediate values are not addresses, so the last
+// operand of ldi and of the *i pseudo-instructions is skipped, as are the
+// labels of jumps.
+static char *address_comment(char *line) {
+  if (strchr(line, ';'))
+    return NULL;
+
+  char *buf = strdup(line);
+  char *ops[4];
+  int n = 0;
+  char *mnemonic = strtok(buf, " ");
+  for (char *t = strtok(NULL, " "); t && n < 4; t = strtok(NULL, " "))
+    ops[n++] = t;
+
+  int first = 0, last = n;
+  if (!strcmp(mnemonic, "ldi") || !strcmp(mnemonic, "addi") || !strcmp(mnemonic, "subi") ||
+      !strcmp(mnemonic, "muli") || !strcmp(mnemonic, "divi") || !strcmp(mnemonic, "modi"))
+    last = n - 1;
+  if (!strcmp(mnemonic, "jnea") || !strcmp(mnemonic, "ja") || !strcmp(mnemonic, "call"))
+    first = 1;
+
+  char *comment = NULL;
+  for (int i = first; i < last; i++) {
+    char *desc = hashmap_get(&addr_comments, ops[i]);
+    bool seen = false;
+    for (int j = first; j < i; j++)
+      seen = seen || !strcmp(ops[j], ops[i]);
+    if (desc && !seen)
+      comment = comment ? format("%s, %s", comment, desc) : desc;
+  }
+  return comment;
+}
 
 static void emit(char *fmt, ...) {
   // Code after an unconditional jump is never executed.
@@ -87,10 +125,15 @@ static void emit(char *fmt, ...) {
 
   va_list ap;
   va_start(ap, fmt);
-  fprintf(out, "    ");
-  vfprintf(out, fmt, ap);
-  fprintf(out, "\n");
+  char buf[1024];
+  vsnprintf(buf, sizeof(buf), fmt, ap);
   va_end(ap);
+
+  char *comment = address_comment(buf);
+  if (comment)
+    fprintf(out, "    %s ; %s\n", buf, comment);
+  else
+    fprintf(out, "    %s\n", buf);
 
   if (!strncmp(fmt, "ret", 3) || !strncmp(fmt, "ja ", 3))
     unreachable = true;
@@ -188,14 +231,25 @@ typedef struct {
   int32_t imm;
   char *name; // slot (define name or address) if !is_imm
   int temp;   // index of the temporary that holds the value, or -1
+  char *sym;  // for an address constant, the define that names it
 } Operand;
 
 static Operand imm(int64_t val) {
-  return (Operand){true, wrap32(val), NULL, -1};
+  return (Operand){true, wrap32(val), NULL, -1, NULL};
+}
+
+// The address of a variable, which is a compile-time constant. `sym` is
+// printed instead of the number, e.g. `ldi t g_arr`.
+static Operand imm_sym(int64_t val, char *sym) {
+  return (Operand){true, wrap32(val), NULL, -1, sym};
+}
+
+static char *imm_text(Operand op) {
+  return op.sym ? op.sym : format("%d", op.imm);
 }
 
 static Operand slot(char *name) {
-  return (Operand){false, 0, name, -1};
+  return (Operand){false, 0, name, -1, NULL};
 }
 
 static bool same_slot(Operand a, Operand b) {
@@ -217,7 +271,7 @@ static Operand new_temp(void) {
   temp_used[i] = true;
   if (current->ntemps < i + 1)
     current->ntemps = i + 1;
-  return (Operand){false, 0, format("t_%s__%d", current->fn->name, i), i};
+  return (Operand){false, 0, format("t_%s__%d", current->fn->name, i), i, NULL};
 }
 
 static void free_op(Operand op) {
@@ -238,7 +292,7 @@ static Operand to_slot(Operand op) {
     return slot(SLOT_MINUS_ONE);
 
   Operand t = new_temp();
-  emit("ldi %s %d", t.name, op.imm);
+  emit("ldi %s %s", t.name, imm_text(op));
   return t;
 }
 
@@ -252,7 +306,7 @@ static void move(Operand to, Operand from) {
   if (same_slot(to, from))
     return;
   if (from.is_imm)
-    emit("ldi %s %d", to.name, from.imm);
+    emit("ldi %s %s", to.name, imm_text(from));
   else
     emit("cpy %s %s", to.name, from.name);
   free_op(from);
@@ -264,6 +318,53 @@ static void move(Operand to, Operand from) {
 
 static Operand gen_expr(Node *node, Operand *hint);
 static void gen_cond(Node *node, bool jump_if, char *target);
+static void gen_stmt(Node *node);
+
+static Node *strip_casts(Node *node) {
+  while (node->kind == ND_CAST)
+    node = node->lhs;
+  return node;
+}
+
+// chibicc rewrites `x op= y`, `x++` and `x--` to go through a pointer to
+// `x`: `tmp = &x, *tmp = *tmp op y`. This matches the `tmp = &x` part.
+static bool is_compound_assign(Node *node) {
+  return node->kind == ND_ASSIGN && node->lhs->kind == ND_VAR &&
+         !*node->lhs->var->name && strip_casts(node->rhs)->kind == ND_ADDR;
+}
+
+static bool const_int(Node *node, int64_t *val) {
+  int64_t a, b;
+  switch (node->kind) {
+  case ND_NUM:
+    *val = wrap32(node->val);
+    return true;
+  case ND_CAST:
+    // chibicc's usual arithmetic conversion casts the integer operand of
+    // pointer arithmetic to the pointer type.
+    if ((!is_integer(node->ty) && node->ty->kind != TY_PTR) || node->ty->kind == TY_BOOL)
+      return false;
+    return const_int(node->lhs, val);
+  case ND_NEG:
+    if (!const_int(node->lhs, &a))
+      return false;
+    *val = wrap32(-(uint64_t)a);
+    return true;
+  case ND_ADD:
+  case ND_SUB:
+  case ND_MUL:
+    if (!const_int(node->lhs, &a) || !const_int(node->rhs, &b))
+      return false;
+    if (node->kind == ND_ADD)
+      *val = wrap32((uint64_t)a + (uint64_t)b);
+    else if (node->kind == ND_SUB)
+      *val = wrap32((uint64_t)a - (uint64_t)b);
+    else
+      *val = wrap32((uint64_t)a * (uint64_t)b);
+    return true;
+  }
+  return false;
+}
 
 // Evaluates `node` into `to`.
 static void gen_expr_to(Node *node, Operand to) {
@@ -272,6 +373,22 @@ static void gen_expr_to(Node *node, Operand to) {
 
 // Evaluates `node` for its side effects only.
 static void gen_void(Node *node) {
+  // `x++` is `(x += 1) - 1`. The subtraction is useless if the value is
+  // unused.
+  Node *n = node;
+  int64_t k;
+  while (n->kind == ND_CAST)
+    n = n->lhs;
+  if ((n->kind == ND_ADD || n->kind == ND_SUB) && const_int(n->rhs, &k)) {
+    Node *lhs = n->lhs;
+    while (lhs->kind == ND_CAST)
+      lhs = lhs->lhs;
+    if (lhs->kind == ND_COMMA && is_compound_assign(lhs->lhs)) {
+      gen_void(lhs);
+      return;
+    }
+  }
+
   free_op(gen_expr(node, NULL));
 }
 
@@ -301,19 +418,280 @@ static void resolve_global(Obj *var, Token *tok) {
     error_tok(tok, "'%s' is declared but never defined (g2 has no linker)", var->name);
   var->asm_name = def->asm_name;
   var->addr = def->addr;
+  var->is_load = def->is_load;
+}
+
+//
+// L-values
+//
+
+// The location of an object: either an address known at compile time,
+// or an address computed at run time and held in a slot.
+typedef struct {
+  bool direct;
+  int addr;      // direct: absolute address
+  Obj *var;      // direct: the variable that contains the address, if any
+  Operand ptr;   // indirect: slot holding the address
+  int offset;    // indirect: added to the address held in `ptr`
+  bool borrowed; // indirect: `ptr` belongs to a binding
+} LValue;
+
+// While compiling `x op= y`, chibicc's temporary pointer to `x` is bound
+// to the l-value of `x`, so that `x`'s address is computed only once and
+// direct variables don't go through a pointer at all.
+typedef struct Binding Binding;
+struct Binding {
+  Binding *next;
+  Obj *var;
+  LValue lv;
+};
+
+static Binding *bindings;
+
+static void ensure_resolved(Obj *var, Token *tok) {
+  if (!var->asm_name)
+    resolve_global(var, tok);
+}
+
+// The operand that names a direct l-value's slot.
+static char *direct_name(LValue *lv) {
+  Obj *var = lv->var;
+  if (var && lv->addr == var->addr)
+    return var->asm_name;
+  char *name = format("%d", lv->addr);
+  if (var)
+    hashmap_put(&addr_comments, name, format("%s+%d", var->asm_name, lv->addr - var->addr));
+  return name;
+}
+
+static void free_lval(LValue *lv) {
+  if (!lv->direct && !lv->borrowed)
+    free_op(lv->ptr);
+}
+
+// Returns a slot that holds the exact address of an indirect l-value.
+static Operand lval_ptr(LValue *lv) {
+  if (lv->offset) {
+    if (!lv->borrowed)
+      free_op(lv->ptr);
+    Operand t = new_temp();
+    emit("addi %s %s %d", t.name, lv->ptr.name, lv->offset);
+    lv->ptr = t;
+    lv->offset = 0;
+    lv->borrowed = false;
+  }
+  return lv->ptr;
+}
+
+static bool const_addr(Node *node, LValue *lv);
+
+// If the object that `node` designates has an address known at compile
+// time, stores it in `lv` and returns true. No code is emitted.
+static bool const_lval(Node *node, LValue *lv) {
+  switch (node->kind) {
+  case ND_VAR: {
+    Obj *var = node->var;
+    if (var->is_function)
+      return false;
+    ensure_resolved(var, node->tok);
+    // The assembler decides where loaded data goes.
+    if (var->is_load)
+      return false;
+    *lv = (LValue){.direct = true, .addr = var->addr, .var = var};
+    return true;
+  }
+  case ND_MEMBER:
+    if (!const_lval(node->lhs, lv))
+      return false;
+    lv->addr += node->member->offset;
+    return true;
+  case ND_DEREF:
+    return const_addr(node->lhs, lv);
+  }
+  return false;
+}
+
+// If the pointer value `node` is a compile-time constant, stores the
+// object it points to in `lv` and returns true.
+static bool const_addr(Node *node, LValue *lv) {
+  int64_t k;
+  switch (node->kind) {
+  case ND_ADDR:
+    return const_lval(node->lhs, lv);
+  case ND_VAR:
+  case ND_DEREF:
+  case ND_MEMBER:
+    // An array decays to the address of its first element.
+    if (node->ty->kind == TY_ARRAY)
+      return const_lval(node, lv);
+    return false;
+  case ND_CAST:
+    if (const_addr(node->lhs, lv))
+      return true;
+    if (node->ty->kind == TY_PTR && const_int(node->lhs, &k)) {
+      *lv = (LValue){.direct = true, .addr = k};
+      return true;
+    }
+    return false;
+  case ND_ADD:
+  case ND_SUB:
+    if (!const_addr(node->lhs, lv) || !const_int(node->rhs, &k))
+      return false;
+    lv->addr += (node->kind == ND_ADD) ? k : -k;
+    return true;
+  }
+  return false;
+}
+
+static LValue gen_lval(Node *node) {
+  LValue lv = {};
+  if (const_lval(node, &lv))
+    return lv;
+
+  switch (node->kind) {
+  case ND_VAR: {
+    Obj *var = node->var;
+    if (var->is_function)
+      error_tok(node->tok, "function pointers are not supported on g2");
+    // Loaded data, whose address only the assembler knows.
+    Operand t = new_temp();
+    emit("ldi %s %s", t.name, var->asm_name);
+    return (LValue){.ptr = t};
+  }
+  case ND_DEREF: {
+    if (node->lhs->kind == ND_VAR) {
+      for (Binding *b = bindings; b; b = b->next) {
+        if (b->var == node->lhs->var) {
+          lv = b->lv;
+          lv.borrowed = true;
+          return lv;
+        }
+      }
+    }
+
+    Operand p = gen_expr(node->lhs, NULL);
+    if (p.is_imm)
+      return (LValue){.direct = true, .addr = p.imm};
+    return (LValue){.ptr = p};
+  }
+  case ND_MEMBER:
+    lv = gen_lval(node->lhs);
+    if (lv.direct)
+      lv.addr += node->member->offset;
+    else
+      lv.offset += node->member->offset;
+    return lv;
+  }
+
+  error_tok(node->tok, "not an lvalue");
+}
+
+// Reads the value of an l-value.
+static Operand load_lval(LValue lv, Operand *hint) {
+  if (lv.direct)
+    return slot(direct_name(&lv));
+
+  Operand p = lval_ptr(&lv);
+  free_lval(&lv);
+  Operand d = dest(hint);
+  emit("rdi %s %s", d.name, p.name);
+  return d;
+}
+
+// The address of the object `node` designates, as a value. This is also
+// the value of an array, which decays to a pointer.
+static Operand gen_address(Node *node, Operand *hint) {
+  if (node->kind == ND_VAR && node->var->is_function)
+    error_tok(node->tok, "function pointers are not supported on g2");
+
+  // Loaded data
+  if (node->kind == ND_VAR) {
+    ensure_resolved(node->var, node->tok);
+    if (node->var->is_load) {
+      Operand d = dest(hint);
+      emit("ldi %s %s", d.name, node->var->asm_name);
+      return d;
+    }
+  }
+
+  LValue lv = gen_lval(node);
+  if (lv.direct) {
+    if (lv.var && lv.addr == lv.var->addr)
+      return imm_sym(lv.addr, lv.var->asm_name);
+    return imm(lv.addr);
+  }
+
+  Operand p = lval_ptr(&lv);
+  if (lv.borrowed)
+    p.temp = -1;
+  return p;
 }
 
 static Operand gen_var(Node *node) {
   Obj *var = node->var;
   if (var->is_function)
     error_tok(node->tok, "function pointers are not supported on g2");
-  if (var->ty->kind == TY_ARRAY)
-    unsupported(node, "arrays");
-  if (var->ty->kind == TY_STRUCT || var->ty->kind == TY_UNION)
-    unsupported(node, "struct and union values");
-  if (!var->asm_name)
-    resolve_global(var, node->tok);
+  if (var->is_addr_tmp)
+    unreachable();
+  ensure_resolved(var, node->tok);
   return slot(var->asm_name);
+}
+
+static Operand gen_assign(Node *node, Operand *hint) {
+  if (node->ty->kind == TY_STRUCT || node->ty->kind == TY_UNION)
+    unsupported(node, "struct and union assignments");
+
+  LValue lv = gen_lval(node->lhs);
+  if (lv.direct) {
+    Operand s = slot(direct_name(&lv));
+    gen_expr_to(node->rhs, s);
+    return s;
+  }
+
+  Operand p = lval_ptr(&lv);
+  Operand v = to_slot(gen_expr(node->rhs, NULL));
+  emit("sti %s %s", p.name, v.name);
+  free_lval(&lv);
+  return v;
+}
+
+// `tmp = &x, *tmp = *tmp op y`, from `x op= y`.
+static Operand gen_compound_assign(Node *node, Operand *hint) {
+  LValue lv = gen_lval(strip_casts(node->lhs->rhs)->lhs);
+  if (!lv.direct)
+    lval_ptr(&lv);
+
+  Binding b = {bindings, node->lhs->lhs->var, lv};
+  bindings = &b;
+  Operand r = gen_expr(node->rhs, hint);
+  bindings = b.next;
+
+  free_lval(&lv);
+  return r;
+}
+
+// Clears a local array or struct before its initializer runs.
+static void gen_memzero(Obj *var) {
+  int size = var->ty->size;
+  if (size <= 32) {
+    for (int i = 0; i < size; i++) {
+      LValue lv = {.direct = true, .addr = var->addr + i, .var = var};
+      emit("ldi %s 0", direct_name(&lv));
+    }
+    return;
+  }
+
+  char *loop = new_label("zero");
+  Operand p = new_temp();
+  Operand end = new_temp();
+  emit("ldi %s %s", p.name, var->asm_name);
+  emit("ldi %s %d", end.name, var->addr + size);
+  emit_label(loop);
+  emit("sti %s %s", p.name, SLOT_ZERO);
+  emit("inc %s", p.name);
+  emit("jnea %s %s %s", loop, p.name, end.name);
+  free_op(p);
+  free_op(end);
 }
 
 // Evaluates a binary operator on two constants with g2 semantics.
@@ -640,13 +1018,6 @@ static Operand gen_funcall(Node *node, Operand *hint) {
   return t;
 }
 
-// chibicc rewrites `x op= y`, `x++` and `x--` to go through a pointer to
-// `x`: `tmp = &x, *tmp = *tmp op y`.
-static bool is_compound_assign(Node *node) {
-  return node->kind == ND_ASSIGN && node->lhs->kind == ND_VAR &&
-         !*node->lhs->var->name && node->rhs->kind == ND_ADDR;
-}
-
 static Operand gen_expr(Node *node, Operand *hint) {
   switch (node->kind) {
   case ND_NULL_EXPR:
@@ -654,7 +1025,17 @@ static Operand gen_expr(Node *node, Operand *hint) {
   case ND_NUM:
     return imm(node->val);
   case ND_VAR:
-    return gen_var(node);
+  case ND_DEREF:
+  case ND_MEMBER:
+    if (node->ty->kind == TY_ARRAY)
+      return gen_address(node, hint);
+    if (node->ty->kind == TY_STRUCT || node->ty->kind == TY_UNION)
+      unsupported(node, "struct and union values");
+    if (node->kind == ND_VAR)
+      return gen_var(node);
+    return load_lval(gen_lval(node), hint);
+  case ND_ADDR:
+    return gen_address(node->lhs, hint);
   case ND_CAST:
     if (node->ty->kind == TY_VOID) {
       gen_void(node->lhs);
@@ -662,22 +1043,33 @@ static Operand gen_expr(Node *node, Operand *hint) {
     }
     if (node->ty->kind == TY_BOOL)
       return gen_truth(node->lhs, false, hint);
+    if (node->ty->kind == TY_STRUCT || node->ty->kind == TY_UNION)
+      unsupported(node, "struct and union values");
     // All other scalar types are 32-bit integers, so the cast is a no-op.
     return gen_expr(node->lhs, hint);
   case ND_COMMA:
     if (is_compound_assign(node->lhs))
-      unsupported(node, "compound assignment, ++ and --");
+      return gen_compound_assign(node, hint);
     gen_void(node->lhs);
     return gen_expr(node->rhs, hint);
-  case ND_ASSIGN: {
-    if (is_compound_assign(node))
-      unsupported(node, "compound assignment, ++ and --");
-    if (node->lhs->kind != ND_VAR)
-      unsupported(node->lhs, "assignments through pointers, arrays and struct members");
-    Operand var = gen_var(node->lhs);
-    gen_expr_to(node->rhs, var);
-    return var;
+  case ND_ASSIGN:
+    return gen_assign(node, hint);
+  case ND_STMT_EXPR: {
+    Node *n = node->body;
+    if (!n)
+      return imm(0);
+    for (; n->next; n = n->next)
+      gen_stmt(n);
+    if (n->kind == ND_EXPR_STMT) {
+      emit_source_line(n->tok);
+      return gen_expr(n->lhs, hint);
+    }
+    gen_stmt(n);
+    return imm(0);
   }
+  case ND_MEMZERO:
+    gen_memzero(node->var);
+    return imm(0);
   case ND_ADD:
   case ND_SUB:
   case ND_MUL:
@@ -730,15 +1122,6 @@ static Operand gen_expr(Node *node, Operand *hint) {
       return imm(fold(node, a.imm, b.imm));
     unsupported(node, "bitwise and shift operators");
   }
-  case ND_ADDR:
-  case ND_DEREF:
-    unsupported(node, "pointers");
-  case ND_MEMBER:
-    unsupported(node, "struct members");
-  case ND_MEMZERO:
-    unsupported(node, "array and struct initializers");
-  case ND_STMT_EXPR:
-    unsupported(node, "statement expressions");
   }
 
   error_tok(node->tok, "invalid expression");
@@ -907,9 +1290,58 @@ static void gen_stmt(Node *node) {
     emit_label(chibicc_label(node->brk_label));
     return;
   }
-  case ND_SWITCH:
+  case ND_SWITCH: {
+    emit_source_line(node->tok);
+    Operand v = to_slot(gen_expr(node->cond, NULL));
+
+    // chibicc lists the cases last first.
+    int ncases = 0;
+    for (Node *c = node->case_next; c; c = c->case_next)
+      ncases++;
+    Node **cases = calloc(ncases, sizeof(Node *));
+    int i = ncases;
+    for (Node *c = node->case_next; c; c = c->case_next)
+      cases[--i] = c;
+
+    for (i = 0; i < ncases; i++) {
+      Node *cs = cases[i];
+      char *label = chibicc_label(cs->label);
+      if (cs->begin == cs->end) {
+        Operand k = to_slot(imm(cs->begin));
+        jump_if_equal(label, v, k);
+        free_op(k);
+        continue;
+      }
+
+      // [GNU] case begin ... end
+      char *next = new_label("next");
+      Operand t = new_temp();
+      Operand lo = to_slot(imm(cs->begin));
+      emit("cmp %s %s %s", t.name, v.name, lo.name);
+      free_op(lo);
+      jump_if_equal(next, t, slot(SLOT_ONE)); // v < begin
+      Operand hi = to_slot(imm(cs->end));
+      emit("cmp %s %s %s", t.name, v.name, hi.name);
+      free_op(hi);
+      emit("jnea %s %s %s", label, t.name, SLOT_MINUS_ONE); // v <= end
+      emit_label(next);
+      free_op(t);
+    }
+
+    free_op(v);
+    if (node->default_case)
+      emit("ja %s", chibicc_label(node->default_case->label));
+    else
+      emit("ja %s", chibicc_label(node->brk_label));
+
+    gen_stmt(node->then);
+    emit_label(chibicc_label(node->brk_label));
+    return;
+  }
   case ND_CASE:
-    unsupported(node, "switch statements");
+    emit_label(chibicc_label(node->label));
+    gen_stmt(node->lhs);
+    return;
   case ND_BLOCK:
     for (Node *n = node->body; n; n = n->next)
       gen_stmt(n);
@@ -954,22 +1386,28 @@ static FnInfo *new_fn_info(Obj *fn) {
 }
 
 // Returns the locals of `fn` in declaration order, parameters first.
+// The pointers that chibicc creates for `x op= y` are left out: the
+// backend binds them to the l-value of `x` instead (gen_compound_assign).
 static Obj **frame_vars(Obj *fn, int *n) {
-  int len = 0;
-  for (Obj *var = fn->locals; var; var = var->next)
-    len++;
+  int nparams = 0, nlocals = 0;
+  for (Obj *var = fn->params; var; var = var->next)
+    nparams++;
+  for (Obj *var = fn->locals; var != fn->params; var = var->next)
+    if (!var->is_addr_tmp)
+      nlocals++;
 
-  Obj **vars = calloc(len, sizeof(Obj *));
+  Obj **vars = calloc(nparams + nlocals, sizeof(Obj *));
   int i = 0;
   for (Obj *var = fn->params; var; var = var->next)
     vars[i++] = var;
 
   // fn->locals lists the newest variable first and ends with the params.
-  int j = len;
+  int j = nparams + nlocals;
   for (Obj *var = fn->locals; var != fn->params; var = var->next)
-    vars[--j] = var;
+    if (!var->is_addr_tmp)
+      vars[--j] = var;
 
-  *n = len;
+  *n = nparams + nlocals;
   return vars;
 }
 
@@ -1122,7 +1560,7 @@ void codegen(Obj *prog, int width, int height, FILE *outfile) {
         tick = obj;
       continue;
     }
-    if (obj->has_fixed_addr || !obj->is_definition)
+    if (obj->has_fixed_addr || obj->is_load || !obj->is_definition)
       continue;
     globals[nglobals++] = obj;
     need_init = need_init || has_initializer(obj);
@@ -1156,6 +1594,28 @@ void codegen(Obj *prog, int width, int height, FILE *outfile) {
     addr += var->ty->size;
     if (!hashmap_get(&global_names, var->name))
       hashmap_put(&global_names, var->name, var);
+  }
+
+  // Data loaded by the assembler. It is placed after #memory, and the
+  // assembler binds its name to the address.
+  Obj **loads = calloc(nobjs + 1, sizeof(Obj *));
+  int nloads = 0;
+  for (int i = 0; i < nobjs; i++) {
+    Obj *var = objs[i];
+    if (var->is_function || !var->is_load)
+      continue;
+    Obj *prev = hashmap_get(&global_names, var->name);
+    if (prev) {
+      if (!prev->is_load || strcmp(prev->load_op, var->load_op) ||
+          strcmp(prev->load_type, var->load_type) || strcmp(prev->load_data, var->load_data))
+        error("conflicting declarations of loaded data '%s'", var->name);
+      var->asm_name = prev->asm_name;
+      continue;
+    }
+    var->asm_name = unique_asm_name(format("g_%s", c_ident(var->name)));
+    var->addr = -1;
+    hashmap_put(&global_names, var->name, var);
+    loads[nloads++] = var;
   }
 
   // Variables bound to VM-managed memory, such as the key states.
@@ -1231,6 +1691,24 @@ void codegen(Obj *prog, int width, int height, FILE *outfile) {
   fprintf(o, "#width %d\n", width);
   fprintf(o, "#height %d\n", height);
   fprintf(o, "#memory %d\n", memory);
+
+  // The assembler reads quoted data with the pattern (['"`])(.*)\1, so
+  // use a quote character that the data doesn't contain.
+  if (nloads)
+    fprintf(o, "\n");
+  for (int i = 0; i < nloads; i++) {
+    Obj *var = loads[i];
+    char *q = "\"";
+    if (strchr(var->load_data, *q))
+      q = "'";
+    if (strchr(var->load_data, *q))
+      q = "`";
+    if (strchr(var->load_data, *q))
+      error("loaded data for '%s' contains all of \", ' and `, which the g2"
+            " assembler can't quote", var->name);
+    fprintf(o, "load %s %s %s %s%s%s\n", var->asm_name, var->load_op, var->load_type,
+            q, var->load_data, q);
+  }
 
   // Memory map
   bool has_fixed = false;

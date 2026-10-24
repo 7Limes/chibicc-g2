@@ -27,4 +27,20 @@ extern const int LEFT __attribute__((address(9)));
 extern const int RIGHT __attribute__((address(10)));
 extern const int DELTA __attribute__((address(11)));
 
+// Data loaded into memory by the assembler. For example,
+//
+//   G2_LOAD(FONT, pack, file, "font.bin");
+//   G2_LOAD(GREETING, raw, string, "Hello");
+//
+// declares FONT and GREETING as const int arrays. The operation is raw
+// (one slot per byte) or pack (four bytes per slot, little-endian).
+// A string is preceded by its length. Relative file paths are relative
+// to the source file. Other tools see a plain array declaration.
+#ifdef __g2__
+#define G2_LOAD(name, op, type, data) \
+  extern const int name[] __attribute__((g2_load(#op, #type, data)))
+#else
+#define G2_LOAD(name, op, type, data) extern const int name[]
+#endif
+
 #endif

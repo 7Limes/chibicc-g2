@@ -1,4 +1,5 @@
 #define _POSIX_C_SOURCE 200809L
+#define _XOPEN_SOURCE 700 // realpath
 #include <assert.h>
 #include <ctype.h>
 #include <errno.h>
@@ -133,6 +134,7 @@ struct Obj {
 
   // Local variable
   int offset;
+  bool is_addr_tmp; // the pointer in chibicc's rewrite of `x op= y`
 
   // Global variable or function
   bool is_function;
@@ -146,6 +148,12 @@ struct Obj {
   Relocation *rel;
   bool has_fixed_addr; // __attribute__((address(N)))
   int fixed_addr;
+
+  // Data loaded by the assembler, __attribute__((g2_load(op, type, data)))
+  bool is_load;
+  char *load_op;   // "raw" or "pack"
+  char *load_type; // "file", "bytes" or "string"
+  char *load_data; // file path (absolute) or string contents
 
   // Function implemented by a single g2 instruction,
   // __attribute__((g2_intrinsic("col"))).
@@ -272,6 +280,9 @@ struct Node {
   // Variable
   Obj *var;
 
+  // Assignment that initializes a variable, which is allowed for const
+  bool is_init;
+
   // Numeric literal
   int64_t val;
 };
@@ -310,6 +321,7 @@ struct Type {
   int size;           // sizeof() value
   int align;          // alignment
   bool is_unsigned;   // unsigned or signed
+  bool is_const;      // const-qualified
   Type *origin;       // for type compatibility check
 
   // Pointer-to or array-of type. We intentionally use the same member

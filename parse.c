@@ -393,6 +393,7 @@ static Type *declspec(Token **rest, Token *tok, VarAttr *attr) {
 
   Type *ty = ty_int;
   int counter = 0;
+  bool is_const = false;
 
   while (is_typename(tok)) {
     // Handle storage class specifiers.
@@ -421,8 +422,13 @@ static Type *declspec(Token **rest, Token *tok, VarAttr *attr) {
       continue;
     }
 
+    if (consume(&tok, tok, "const")) {
+      is_const = true;
+      continue;
+    }
+
     // These keywords are recognized but ignored.
-    if (consume(&tok, tok, "const") || consume(&tok, tok, "volatile") ||
+    if (consume(&tok, tok, "volatile") ||
         consume(&tok, tok, "auto") || consume(&tok, tok, "register") ||
         consume(&tok, tok, "restrict") || consume(&tok, tok, "__restrict") ||
         consume(&tok, tok, "__restrict__") || consume(&tok, tok, "_Noreturn"))
@@ -529,6 +535,11 @@ static Type *declspec(Token **rest, Token *tok, VarAttr *attr) {
     tok = tok->next;
   }
 
+  if (is_const) {
+    ty = copy_type(ty);
+    ty->is_const = true;
+  }
+
   *rest = tok;
   return ty;
 }
@@ -617,8 +628,11 @@ static Type *pointers(Token **rest, Token *tok, Type *ty) {
   while (consume(&tok, tok, "*")) {
     ty = pointer_to(ty);
     while (equal(tok, "const") || equal(tok, "volatile") || equal(tok, "restrict") ||
-           equal(tok, "__restrict") || equal(tok, "__restrict__"))
+           equal(tok, "__restrict") || equal(tok, "__restrict__")) {
+      if (equal(tok, "const"))
+        ty->is_const = true;
       tok = tok->next;
+    }
   }
   *rest = tok;
   return ty;
@@ -1236,7 +1250,9 @@ static Node *create_lvar_init(Initializer *init, Type *ty, InitDesg *desg, Token
     return new_node(ND_NULL_EXPR, tok);
 
   Node *lhs = init_desg_expr(desg, tok);
-  return new_binary(ND_ASSIGN, lhs, init->expr, tok);
+  Node *node = new_binary(ND_ASSIGN, lhs, init->expr, tok);
+  node->is_init = true;
+  return node;
 }
 
 // A variable definition with an initializer is a shorthand notation
@@ -1837,6 +1853,7 @@ static Node *to_assign(Node *binary) {
   // Convert `A.x op= C` to `tmp = &A, (*tmp).x = (*tmp).x op C`.
   if (binary->lhs->kind == ND_MEMBER) {
     Obj *var = new_lvar("", pointer_to(binary->lhs->lhs->ty));
+    var->is_addr_tmp = true;
 
     Node *expr1 = new_binary(ND_ASSIGN, new_var_node(var, tok),
                              new_unary(ND_ADDR, binary->lhs->lhs, tok), tok);
@@ -1860,6 +1877,7 @@ static Node *to_assign(Node *binary) {
 
   // Convert `A op= B` to ``tmp = &A, *tmp = *tmp op B`.
   Obj *var = new_lvar("", pointer_to(binary->lhs->ty));
+  var->is_addr_tmp = true;
 
   Node *expr1 = new_binary(ND_ASSIGN, new_var_node(var, tok),
                            new_unary(ND_ADDR, binary->lhs, tok), tok);
@@ -2319,11 +2337,23 @@ typedef struct {
   int address;
   Token *intrinsic_tok; // g2_intrinsic("name")
   char *intrinsic;
+  Token *load_tok;      // g2_load("op", "type", "data")
+  char *load_op;
+  char *load_type;
+  Token *load_data;
 } DeclAttr;
+
+static char *attr_string(Token **rest, Token *tok) {
+  if (tok->kind != TK_STR)
+    error_tok(tok, "expected a string literal");
+  *rest = tok->next;
+  return tok->str;
+}
 
 // decl-attribute = ("__attribute__" "(" "(" decl-attr ("," decl-attr)* ")" ")")*
 // decl-attr      = "address" "(" const-expr ")"
 //                | "g2_intrinsic" "(" string-literal ")"
+//                | "g2_load" "(" string-literal "," string-literal "," string-literal ")"
 static Token *decl_attribute_list(Token *tok, DeclAttr *da) {
   while (consume(&tok, tok, "__attribute__")) {
     tok = skip(tok, "(");
@@ -2349,10 +2379,21 @@ static Token *decl_attribute_list(Token *tok, DeclAttr *da) {
       if (equal(tok, "g2_intrinsic")) {
         da->intrinsic_tok = tok;
         tok = skip(tok->next, "(");
-        if (tok->kind != TK_STR)
-          error_tok(tok, "expected a string literal");
-        da->intrinsic = tok->str;
-        tok = skip(tok->next, ")");
+        da->intrinsic = attr_string(&tok, tok);
+        tok = skip(tok, ")");
+        continue;
+      }
+
+      if (equal(tok, "g2_load")) {
+        da->load_tok = tok;
+        tok = skip(tok->next, "(");
+        da->load_op = attr_string(&tok, tok);
+        tok = skip(tok, ",");
+        da->load_type = attr_string(&tok, tok);
+        tok = skip(tok, ",");
+        da->load_data = tok;
+        attr_string(&tok, tok);
+        tok = skip(tok, ")");
         continue;
       }
 
@@ -2934,6 +2975,8 @@ static Token *function(Token *tok, Type *basety, VarAttr *attr) {
   tok = decl_attribute_list(tok, &da);
   if (da.address_tok)
     error_tok(da.address_tok, "the address attribute only applies to variables");
+  if (da.load_tok)
+    error_tok(da.load_tok, "g2_load only applies to array declarations");
 
   Obj *fn = find_func(name_str);
   if (fn) {
@@ -3008,6 +3051,62 @@ static Token *function(Token *tok, Type *basety, VarAttr *attr) {
   return tok;
 }
 
+static bool is_printable_ascii(char *s) {
+  for (; *s; s++)
+    if (*s < 0x20 || *s > 0x7e)
+      return false;
+  return true;
+}
+
+// Marks `var` as data that the assembler loads into memory, as declared
+// by the G2_LOAD macro in g2.h.
+static void apply_load_attr(Obj *var, DeclAttr *da, Type *ty, Token *tok) {
+  if (ty->kind != TY_ARRAY || (ty->base->kind != TY_INT && ty->base->kind != TY_CHAR))
+    error_tok(ty->name, "g2_load requires an int or char array declaration");
+  if (equal(tok, "="))
+    error_tok(tok, "loaded data can't have an initializer");
+  if (var->has_fixed_addr)
+    error_tok(da->load_tok, "g2_load can't be combined with the address attribute");
+
+  char *op = da->load_op, *type = da->load_type;
+  if (strcmp(op, "raw") && strcmp(op, "pack"))
+    error_tok(da->load_tok, "unknown load operation \"%s\" (expected raw or pack)", op);
+  if (strcmp(type, "file") && strcmp(type, "bytes") && strcmp(type, "string"))
+    error_tok(da->load_tok, "unknown load data type \"%s\" (expected file, bytes or string)",
+              type);
+
+  Token *data_tok = da->load_data;
+  char *data = data_tok->str;
+
+  if (!strcmp(type, "bytes"))
+    error_tok(data_tok, "bytes data is not supported yet: the g2 assembler can't"
+              " parse it (see g2-port-plan.md, section 13)");
+
+  if (!strcmp(type, "string") && !is_printable_ascii(data))
+    error_tok(data_tok, "loaded strings must be printable ASCII, because the g2"
+              " assembler doesn't process escape sequences");
+
+  if (!strcmp(type, "file")) {
+    // Resolve the path relative to the source file that names it. The
+    // assembler would otherwise resolve it against its working directory.
+    Token *t = data_tok;
+    while (t->origin)
+      t = t->origin;
+    char *path = data;
+    if (*path != '/')
+      path = format("%s/%s", dirname(strdup(t->file->name)), data);
+    char *abs = realpath(path, NULL);
+    if (!abs)
+      error_tok(data_tok, "cannot open %s: %s", path, strerror(errno));
+    data = abs;
+  }
+
+  var->is_load = true;
+  var->load_op = op;
+  var->load_type = type;
+  var->load_data = data;
+}
+
 static Token *global_variable(Token *tok, Type *basety, VarAttr *attr) {
   bool first = true;
 
@@ -3051,6 +3150,9 @@ static Token *global_variable(Token *tok, Type *basety, VarAttr *attr) {
 
     if (var->has_fixed_addr && equal(tok, "="))
       error_tok(tok, "a variable with a fixed address can't have an initializer");
+
+    if (da.load_tok)
+      apply_load_attr(var, &da, ty, tok);
 
     if (equal(tok, "="))
       gvar_initializer(&tok, tok->next, var);

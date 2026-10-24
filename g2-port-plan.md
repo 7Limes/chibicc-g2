@@ -967,6 +967,23 @@ without `start()` is normal.
 
 *Milestone:* `snake_g1.c` compiles, given the library functions it needs, and runs.
 
+*Status:* done. Snake was tested with three changes: `G2_LOAD` in place of `load`, `WIDTH`/`HEIGHT`
+moved above `#include <g2.h>`, and placeholder versions of the five library functions. It compiles
+to 299 instructions and 240 slots of memory, assembles with `g2a`, and plays correctly in the
+headless VM: it moves, turns, eats the apple and grows, resets on hitting itself, and wraps at the
+edges. Notes:
+
+- Struct member access (`.`, `->`, members in `op=`) and pointers to structs came along with
+  l-values. Struct assignment and struct values are still rejected (Phase 4).
+- `x op= y`, `x++` and `x--` bind chibicc's temporary `&x` to the l-value of `x`, so a variable or
+  an element with a constant index is updated in place (`arr[4]++` is `inc 37`). The temporaries
+  get no memory.
+- Addresses known at compile time (`arr[3]`, `s.y`, `&x`) are direct operands. Numeric ones get a
+  comment such as `; g_arr+3`.
+- Local arrays and structs with an initializer are cleared slot by slot (or with a loop above 32
+  slots) and then assigned. Slots that are cleared and then immediately overwritten are a
+  Phase 4 peephole target.
+
 ### Phase 3: Library and bitwise
 
 1. `g2lib.c`: `hexcolor`, `seed_rand`, `next_rand`, `int_to_str`, `draw_text`.
