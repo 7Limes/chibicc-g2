@@ -10,3 +10,4 @@
 *.g2asm
 /test/*.exe
 /stage2
+__pycache__/

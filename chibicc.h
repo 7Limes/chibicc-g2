@@ -115,6 +115,7 @@ void init_macros(void);
 void define_macro(char *name, char *buf);
 void undef_macro(char *name);
 Token *preprocess(Token *tok);
+int window_dimension(char *name);
 
 //
 // parse.c
@@ -140,8 +141,19 @@ struct Obj {
 
   // Global variable
   bool is_tentative;
+  bool is_str_lit;
   int32_t *init_data; // initial value, one element per memory slot
   Relocation *rel;
+  bool has_fixed_addr; // __attribute__((address(N)))
+  int fixed_addr;
+
+  // Function implemented by a single g2 instruction,
+  // __attribute__((g2_intrinsic("col"))).
+  char *intrinsic;
+
+  // g2 backend
+  char *asm_name; // name of the slot (define) or label in the output
+  int addr;       // absolute memory address of a variable
 
   // Function
   bool is_inline;
@@ -265,6 +277,9 @@ struct Node {
 };
 
 Node *new_cast(Node *expr, Type *ty);
+int64_t wrap32(int64_t val);
+int64_t floor_div(Node *node, int64_t a, int64_t b);
+int64_t floor_mod(Node *node, int64_t a, int64_t b);
 int64_t const_expr(Token **rest, Token *tok);
 Obj *parse(Token *tok);
 
@@ -375,7 +390,7 @@ void add_type(Node *node);
 // codegen_g2.c
 //
 
-void codegen(Obj *prog, FILE *out);
+void codegen(Obj *prog, int width, int height, FILE *out);
 int align_to(int n, int align);
 
 //
@@ -420,4 +435,5 @@ bool file_exists(char *path);
 
 extern StringArray include_paths;
 extern bool opt_fcommon;
+extern int opt_memory;
 extern char *base_file;

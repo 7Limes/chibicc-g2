@@ -329,6 +329,7 @@ static Obj *new_anon_gvar(Type *ty) {
 
 static Obj *new_string_literal(char *p, Type *ty) {
   Obj *var = new_anon_gvar(ty);
+  var->is_str_lit = true;
   var->init_data = calloc(ty->array_len, sizeof(int32_t));
   for (int i = 0; i < ty->array_len; i++)
     var->init_data[i] = (unsigned char)p[i];
@@ -1252,14 +1253,20 @@ static Node *lvar_initializer(Token **rest, Token *tok, Obj *var) {
   Initializer *init = initializer(rest, tok, var->ty, &var->ty);
   InitDesg desg = {NULL, 0, NULL, var};
 
+  Node *rhs = create_lvar_init(init, var->ty, &desg, tok);
+
+  // A scalar always has an initializer expression, so it doesn't need
+  // to be cleared first. Each cleared slot costs an instruction on g2.
+  if (var->ty->kind != TY_ARRAY && var->ty->kind != TY_STRUCT &&
+      var->ty->kind != TY_UNION)
+    return rhs;
+
   // If a partial initializer list is given, the standard requires
   // that unspecified elements are set to 0. Here, we simply
   // zero-initialize the entire memory region of a variable before
   // initializing it with user-supplied values.
   Node *lhs = new_node(ND_MEMZERO, tok);
   lhs->var = var;
-
-  Node *rhs = create_lvar_init(init, var->ty, &desg, tok);
   return new_binary(ND_COMMA, lhs, rhs, tok);
 }
 
@@ -1295,7 +1302,7 @@ write_gvar_data(Relocation *cur, Initializer *init, Type *ty, int32_t *buf, int 
   int64_t val = eval2(init->expr, &label);
 
   if (!label) {
-    buf[offset] = val;
+    buf[offset] = (ty->kind == TY_BOOL) ? (val != 0) : val;
     return cur;
   }
 
@@ -1636,13 +1643,13 @@ static int64_t eval(Node *node) {
 }
 
 // Wraps a value to a 32-bit signed integer, as g2 arithmetic does.
-static int64_t wrap32(int64_t val) {
+int64_t wrap32(int64_t val) {
   return (int32_t)(uint32_t)val;
 }
 
 // g2's div rounds toward negative infinity (unlike C, which truncates
 // toward zero). Constant folding must give the same result as the VM.
-static int64_t floor_div(Node *node, int64_t a, int64_t b) {
+int64_t floor_div(Node *node, int64_t a, int64_t b) {
   if (b == 0)
     error_tok(node->tok, "division by zero in constant expression");
   int64_t q = a / b;
@@ -1653,7 +1660,7 @@ static int64_t floor_div(Node *node, int64_t a, int64_t b) {
 
 // g2's mod takes the sign of the divisor, so that
 // a == floor_div(a, b) * b + floor_mod(a, b).
-static int64_t floor_mod(Node *node, int64_t a, int64_t b) {
+int64_t floor_mod(Node *node, int64_t a, int64_t b) {
   if (b == 0)
     error_tok(node->tok, "division by zero in constant expression");
   int64_t r = a % b;
@@ -2306,6 +2313,58 @@ static void struct_members(Token **rest, Token *tok, Type *ty) {
   ty->members = head.next;
 }
 
+// Attributes attached to a variable or function declaration.
+typedef struct {
+  Token *address_tok;   // address(N)
+  int address;
+  Token *intrinsic_tok; // g2_intrinsic("name")
+  char *intrinsic;
+} DeclAttr;
+
+// decl-attribute = ("__attribute__" "(" "(" decl-attr ("," decl-attr)* ")" ")")*
+// decl-attr      = "address" "(" const-expr ")"
+//                | "g2_intrinsic" "(" string-literal ")"
+static Token *decl_attribute_list(Token *tok, DeclAttr *da) {
+  while (consume(&tok, tok, "__attribute__")) {
+    tok = skip(tok, "(");
+    tok = skip(tok, "(");
+
+    bool first = true;
+
+    while (!consume(&tok, tok, ")")) {
+      if (!first)
+        tok = skip(tok, ",");
+      first = false;
+
+      if (equal(tok, "address")) {
+        da->address_tok = tok;
+        tok = skip(tok->next, "(");
+        da->address = const_expr(&tok, tok);
+        tok = skip(tok, ")");
+        if (da->address < 0)
+          error_tok(da->address_tok, "address must not be negative");
+        continue;
+      }
+
+      if (equal(tok, "g2_intrinsic")) {
+        da->intrinsic_tok = tok;
+        tok = skip(tok->next, "(");
+        if (tok->kind != TK_STR)
+          error_tok(tok, "expected a string literal");
+        da->intrinsic = tok->str;
+        tok = skip(tok->next, ")");
+        continue;
+      }
+
+      error_tok(tok, "unknown attribute");
+    }
+
+    tok = skip(tok, ")");
+  }
+
+  return tok;
+}
+
 // attribute = ("__attribute__" "(" "(" "packed" ")" ")")*
 static Token *attribute_list(Token *tok, Type *ty) {
   while (consume(&tok, tok, "__attribute__")) {
@@ -2871,6 +2930,11 @@ static Token *function(Token *tok, Type *basety, VarAttr *attr) {
     error_tok(ty->name_pos, "function name omitted");
   char *name_str = get_ident(ty->name);
 
+  DeclAttr da = {};
+  tok = decl_attribute_list(tok, &da);
+  if (da.address_tok)
+    error_tok(da.address_tok, "the address attribute only applies to variables");
+
   Obj *fn = find_func(name_str);
   if (fn) {
     // Redeclaration
@@ -2892,6 +2956,28 @@ static Token *function(Token *tok, Type *basety, VarAttr *attr) {
   // The entry stub calls start() and tick(), so they are the only roots.
   // Functions that are not reachable from them are never emitted.
   fn->is_root = !strcmp(fn->name, "start") || !strcmp(fn->name, "tick");
+
+  if (da.intrinsic) {
+    int nparams;
+    if (!strcmp(da.intrinsic, "col"))
+      nparams = 3;
+    else if (!strcmp(da.intrinsic, "pix"))
+      nparams = 2;
+    else
+      error_tok(da.intrinsic_tok->next->next, "unknown g2 intrinsic \"%s\"", da.intrinsic);
+
+    int n = 0;
+    for (Type *t = ty->params; t; t = t->next)
+      n++;
+    if (n != nparams)
+      error_tok(ty->name, "the %s intrinsic takes %d parameters", da.intrinsic, nparams);
+    if (ty->return_ty->kind != TY_VOID)
+      error_tok(ty->name, "an intrinsic function must return void");
+    fn->intrinsic = da.intrinsic;
+  }
+
+  if (fn->intrinsic && equal(tok, "{"))
+    error_tok(tok, "an intrinsic function can't have a body");
 
   // Struct and union values can't be passed to or returned from
   // functions on g2. Pass a pointer instead.
@@ -2934,11 +3020,37 @@ static Token *global_variable(Token *tok, Type *basety, VarAttr *attr) {
     if (!ty->name)
       error_tok(ty->name_pos, "variable name omitted");
 
-    Obj *var = new_gvar(get_ident(ty->name), ty);
+    DeclAttr da = {};
+    tok = decl_attribute_list(tok, &da);
+    if (da.intrinsic_tok)
+      error_tok(da.intrinsic_tok, "g2_intrinsic only applies to functions");
+
+    char *name = get_ident(ty->name);
+    VarScope *prev = hashmap_get(&scope->vars, name);
+
+    Obj *var = new_gvar(name, ty);
     var->is_definition = !attr->is_extern;
     var->is_static = attr->is_static;
     if (attr->align)
       var->align = attr->align;
+
+    // A variable bound to a fixed address is not allocated. It refers to
+    // memory the VM manages, such as the key states.
+    if (da.address_tok) {
+      var->has_fixed_addr = true;
+      var->fixed_addr = da.address;
+    }
+
+    // Redeclarations keep the address of an earlier declaration.
+    if (prev && prev->var && prev->var->has_fixed_addr) {
+      if (var->has_fixed_addr && var->fixed_addr != prev->var->fixed_addr)
+        error_tok(ty->name, "conflicting addresses for '%s'", name);
+      var->has_fixed_addr = true;
+      var->fixed_addr = prev->var->fixed_addr;
+    }
+
+    if (var->has_fixed_addr && equal(tok, "="))
+      error_tok(tok, "a variable with a fixed address can't have an initializer");
 
     if (equal(tok, "="))
       gvar_initializer(&tok, tok->next, var);

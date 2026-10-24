@@ -48,6 +48,7 @@ struct Macro {
   char *va_args_name;
   Token *body;
   macro_handler_fn *handler;
+  Token *def_tok; // macro name in its #define, if defined in source
 };
 
 // `#if` can be nested, so we use a stack to manage nested `#if`s.
@@ -365,23 +366,65 @@ static MacroParam *read_macro_params(Token **rest, Token *tok, char **va_args_na
   return head.next;
 }
 
+// Returns true if two macro definitions are the same as defined by
+// the C standard: same kind, same parameters, and replacement lists
+// with the same spelling and the same whitespace separation.
+static bool same_macro_definition(Macro *m1, Macro *m2) {
+  if (m1->is_objlike != m2->is_objlike || m1->handler || m2->handler)
+    return false;
+
+  MacroParam *p1 = m1->params, *p2 = m2->params;
+  for (; p1 && p2; p1 = p1->next, p2 = p2->next)
+    if (strcmp(p1->name, p2->name))
+      return false;
+  if (p1 || p2)
+    return false;
+
+  if (!m1->va_args_name != !m2->va_args_name)
+    return false;
+  if (m1->va_args_name && strcmp(m1->va_args_name, m2->va_args_name))
+    return false;
+
+  Token *t1 = m1->body, *t2 = m2->body;
+  for (; t1->kind != TK_EOF && t2->kind != TK_EOF; t1 = t1->next, t2 = t2->next) {
+    if (t1->len != t2->len || memcmp(t1->loc, t2->loc, t1->len))
+      return false;
+    if (t1 != m1->body && t1->has_space != t2->has_space)
+      return false;
+  }
+  return t1->kind == TK_EOF && t2->kind == TK_EOF;
+}
+
 static void read_macro_definition(Token **rest, Token *tok) {
   if (tok->kind != TK_IDENT)
     error_tok(tok, "macro name must be an identifier");
+  Token *name_tok = tok;
   char *name = strndup(tok->loc, tok->len);
+  Macro *old = hashmap_get(&macros, name);
   tok = tok->next;
 
+  Macro *m;
   if (!tok->has_space && equal(tok, "(")) {
     // Function-like macro
     char *va_args_name = NULL;
     MacroParam *params = read_macro_params(&tok, tok->next, &va_args_name);
 
-    Macro *m = add_macro(name, false, copy_line(rest, tok));
+    m = add_macro(name, false, copy_line(rest, tok));
     m->params = params;
     m->va_args_name = va_args_name;
   } else {
     // Object-like macro
-    add_macro(name, true, copy_line(rest, tok));
+    m = add_macro(name, true, copy_line(rest, tok));
+  }
+  m->def_tok = name_tok;
+
+  // A redefinition that differs from the original is almost always a
+  // mistake. On g2 it matters even more, because the final values of
+  // WIDTH and HEIGHT set the window size.
+  if (old && !same_macro_definition(old, m)) {
+    warn_tok(name_tok, "'%s' redefined", name);
+    if (old->def_tok)
+      warn_tok(old->def_tok, "previous definition was here");
   }
 }
 
@@ -1138,6 +1181,42 @@ static void join_adjacent_string_literals(Token *tok) {
     tok1->next = tok2;
     tok1 = tok2;
   }
+}
+
+// Returns the value of the window dimension macro `name` (WIDTH or
+// HEIGHT) as it is defined at the end of the translation unit. The
+// macro is expanded and evaluated like an #if expression, so values
+// such as `(TILE * 8)` are allowed.
+int window_dimension(char *name) {
+  Macro *m = hashmap_get(&macros, name);
+  if (!m)
+    error("%s is not defined (define it before including g2.h, or pass -D%s=N)",
+          name, name);
+  if (!m->is_objlike)
+    error("%s must be an object-like macro", name);
+
+  Token *tok = tokenize(new_file("<window size>", 1, format("%s\n", name)));
+  tok = preprocess2(tok);
+
+  // Keep the expansion's spelling for error messages.
+  char *text = "";
+  for (Token *t = tok; t->kind != TK_EOF; t = t->next)
+    text = format("%s%s%.*s", text, *text ? " " : "", t->len, t->loc);
+
+  for (Token *t = tok; t->kind != TK_EOF; t = t->next)
+    if (t->kind != TK_PP_NUM && t->kind != TK_PUNCT)
+      error("%s does not evaluate to an integer constant: '%s'", name, text);
+  if (tok->kind == TK_EOF)
+    error("%s does not evaluate to an integer constant: ''", name);
+
+  convert_pp_tokens(tok);
+  Token *rest;
+  int64_t val = const_expr(&rest, tok);
+  if (rest->kind != TK_EOF)
+    error("%s does not evaluate to an integer constant: '%s'", name, text);
+  if (val < 1)
+    error("%s must be at least 1 (got %ld)", name, (long)val);
+  return val;
 }
 
 // Entry point function of the preprocessor.

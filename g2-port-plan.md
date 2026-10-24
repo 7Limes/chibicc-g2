@@ -435,15 +435,23 @@ Every slot gets a `define` so the assembly reads well:
 | Global | `g_<name>` | `define g_head_x 161` |
 | Fixed-address global | `g_<name>` (address from attribute) | `define g_UP 7` |
 | String literal | `__str<N>` | `define __str3 200` |
-| Param/local | `<func>__<name>`, plus `_<k>` if shadowed | `define move_snake__packed_pos 190` |
-| Temp | `<func>__t<k>` | `define move_snake__t0 192` |
+| Param/local | `l_<func>__<name>`, plus `_<k>` if the name is taken | `define l_move_snake__packed_pos 190` |
+| Temp | `t_<func>__<k>` | `define t_move_snake__0 192` |
+| Other anonymous global (static local) | `__anon<N>` | `define __anon0 40` |
 | Compiler globals | `__g2_<name>` | `define __g2_started 32` |
 | Function label | `fn_<name>` (including `fn_start`, `fn_tick`) | `fn_move_snake:` |
-| Internal label | `__L<N>_<what>`, `__g2_entry_*`, `__g2_end` | `__L12_else:` |
+| Internal label | `__L<N>_<what>` (codegen), `__C<N>` (chibicc's `break`/`continue`/`goto` labels), `__g2_entry_*`, `__g2_end` | `__L12_else:` |
 | Load data | `<NAME>` exactly as written (it is the user's own symbol) | `load FONT pack file "..."` |
 
 g2 identifiers follow C's identifier rules, so every mangled name above is valid as it is. Labels have
 their own namespace. **Defines and load names share a namespace**, so:
+
+- **Every emitted name starts with one of the prefixes `g_`, `l_`, `t_`, `fn_` or `__`.** The
+  assembler's lexer (rply) uses the first rule that matches rather than the longest match, so a name
+  that *begins* with `define`, `load`, `WIDTH`, `HEIGHT` or `MEMORY` is split into that keyword and the
+  rest. A local in a function called `load_level` would break if names began with the C name.
+- Labels and defines must not share a name either: when the assembler resolves an operand, it checks
+  labels before constants, so a label would silently shadow a define. The prefixes keep the two sets apart.
 
 - Function labels (`fn_*`, `__L*`) cannot clash with any define or load name.
 - The prefixes keep defines from clashing with mnemonics (`add`, `col`, `pix` …) and with each other.
@@ -906,17 +914,24 @@ Each phase ends with a milestone program that has to assemble and run on the rea
 
 *Milestone:* a program that moves a pixel with the arrow keys and changes colour on `A`.
 
+*Status:* done (`example/move_pixel.c`). Some Phase 2 items were cheap to include once `gen_cond`
+existed, so Phase 1 also has `&&`, `||`, `!`, `?:`, the comma operator, comparisons as values,
+`_Bool` casts, `~`, `do-while`, `goto`/labels, scalar global initialisers, and source-line comments.
+It also has the headless test runner (§11). Only a missing `tick()` triggers a warning: a program
+without `start()` is normal.
+
 ### Phase 2: Full snake subset
 
 1. Pointers: `&`, `*`, `rdi`/`sti`, indirect l-values. Arrays: decay, indexing (direct when the index
    is constant).
 2. Compound assignment and `++`/`--` (pattern-matching the parser's rewrites), plus value-unused tracking.
-3. `&&`, `||`, `!`, `?:`, comma, materialised comparison values, `_Bool` casts.
-4. `do-while`, `switch`/`case`/`default`, `goto`/labels, statement expressions.
-5. Global initialisers (`ldi` block in the entry stub's one-time path), local initialisers and `ND_MEMZERO`,
-   and string/char literals.
-6. The `load` statement.
-7. Comment lines with the C source of each statement.
+3. `switch`/`case`/`default` and statement expressions.
+4. Local aggregate initialisers and `ND_MEMZERO`, and string literals as values. Global
+   initialisers, arrays and strings included, are already emitted with one `ldi` per non-zero slot.
+5. Enforce `const`. chibicc parses it and then ignores it, so `UP = 1;` currently compiles even
+   though `g2.h` declares the keys `const`.
+6. The `load` statement. Also reject load names that clash with the assembler's predefined
+   constants (§13).
 
 *Milestone:* `snake_g1.c` compiles, given the library functions it needs, and runs.
 
@@ -950,12 +965,12 @@ See §12.
 The existing `test/` suite targets x86, `printf` and the host linker, so it cannot run as is.
 Build a new one:
 
-1. **A headless g2 runner.** Use one of these:
-   - your real assembler plus the `cg2` VM with a headless mode: run N frames from instruction 0, then
-     dump memory as JSON. This is preferred because it tests the real toolchain.
-   - a small `tools/g2sim.py` that interprets `.g2asm` text directly, implementing the primitives and
-     the pseudo-ops from the spec, and running whole frames from instruction 0. It is faster to iterate on, but it may differ from the real assembler
-     in edge cases.
+1. **A headless g2 runner (implemented in Phase 1).** Programs are assembled by the real assembler
+   (`g2a`), so pseudo-instruction expansion is the real one. The resulting `.g2b` runs in
+   `tools/g2run.py`, a small headless VM that follows the reference VM (`cg2`). It runs N frames from
+   instruction 0 with scripted key presses (`--press RIGHT:0-4`) and prints memory by define name and
+   the pixels drawn in the last frame. `tools/run_tests.py` (run by `make test`) drives the suite.
+   Tests whose first line is `// expect-error: <text>` must fail to compile with that message.
 2. **`test-g2/*.c` in chibicc's `ASSERT` style.** `test-g2/test.h` provides
    `static void assert_eq(int line, int expected, int actual)`, which on failure records
    `__test_fail_line = line` (a global). Each test does its work in `start()`, so a single frame is enough. The runner reads the
@@ -1019,6 +1034,18 @@ The resolved items are recorded here because the design depends on them.
   (§12) until that is added to the assembler.
 - **Window metadata.** It comes from the `WIDTH`/`HEIGHT` macros, with header defaults behind
   `#ifndef` guards and no `-mwidth`/`-mheight` flags (§3.7).
+- **Facts from the assembler's source (`g2asm/assembler.py`, `instructions.py`, `lexer.py`).**
+  - Pseudo-instructions expand to: `cpy` → `add d s 0`; `sub` → `mul 14 2 b; add d a 14`;
+    `addi`/`muli`/`divi`/`modi` → `ldi 14 k` plus the operation; `inc`/`dec` → `add d d 1`/`2`;
+    `jnea`/`ja` → `ldi 14 L; jne 14 …`. `call` pushes the return address at `$15` and increments
+    slot 15. `ret` decrements it and jumps. Every one of them reads its operands before it writes
+    its destination.
+  - The code section has to start with an instruction. A label as the first code token is rejected,
+    which the entry stub satisfies.
+  - The assembler predefines the constants `CONTROL1`, `CONTROL2`, `A`, `B`, `UP`, `DOWN`, `LEFT`,
+    `RIGHT` and `DELTA` (as addresses). A `load` with one of these names would only produce a
+    warning and keep the predefined value, so the `load` parser (Phase 2) must reject them.
+  - Naming constraints from the lexer are described in §5.2.
 - **Recursion.** It is not required. The fixed-address frame model (§3.2) is the final design.
 
 ### Still open

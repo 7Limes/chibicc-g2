@@ -3,6 +3,10 @@
 StringArray include_paths;
 bool opt_fcommon = true;
 
+// Total memory size requested with -mmemory=N, or 0 to use exactly
+// as much memory as the program needs.
+int opt_memory;
+
 static StringArray opt_include;
 static bool opt_E;
 static bool opt_M;
@@ -18,7 +22,7 @@ static StringArray std_include_paths;
 char *base_file;
 
 static void usage(int status) {
-  fprintf(stderr, "chibicc-g2 [ -o <path> ] [ -E ] [ -I<dir> ] [ -D<name>[=<value>] ] <file.c>\n");
+  fprintf(stderr, "chibicc-g2 [ -o <path> ] [ -E ] [ -I<dir> ] [ -D<name>[=<value>] ] [ -mmemory=<slots> ] <file.c>\n");
   exit(status);
 }
 
@@ -120,6 +124,15 @@ static void parse_args(int argc, char **argv) {
 
     if (!strcmp(argv[i], "-E")) {
       opt_E = true;
+      continue;
+    }
+
+    if (!strncmp(argv[i], "-mmemory=", 9)) {
+      char *end;
+      long n = strtol(argv[i] + 9, &end, 10);
+      if (*end || end == argv[i] + 9 || n < 1 || n > INT32_MAX)
+        error("<command line>: invalid memory size: %s", argv[i] + 9);
+      opt_memory = n;
       continue;
     }
 
@@ -382,13 +395,18 @@ static void compile(char *output_file) {
 
   Obj *prog = parse(tok);
 
+  // The window size comes from the final values of the WIDTH and HEIGHT
+  // macros, so that the window always matches what the code uses.
+  int width = window_dimension("WIDTH");
+  int height = window_dimension("HEIGHT");
+
   // Open a temporary output buffer.
   char *buf;
   size_t buflen;
   FILE *output_buf = open_memstream(&buf, &buflen);
 
   // Traverse the AST to emit assembly.
-  codegen(prog, output_buf);
+  codegen(prog, width, height, output_buf);
   fclose(output_buf);
 
   // Write the asembly text to a file.
