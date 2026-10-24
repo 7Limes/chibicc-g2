@@ -316,7 +316,7 @@ static void print_dependencies(void) {
   if (opt_MT)
     fprintf(out, "%s:", opt_MT);
   else
-    fprintf(out, "%s:", quote_makefile(replace_extn(base_file, ".g2asm")));
+    fprintf(out, "%s:", quote_makefile(replace_extn(base_file, ".g2")));
 
   File **files = get_input_files();
 
@@ -375,6 +375,16 @@ static void compile(char *output_file) {
     tok = append_tokens(tok, tok2);
   }
 
+  // The runtime helpers that the backend calls for bitwise operators.
+  // Unused helpers are not emitted.
+  if (!opt_E && !opt_M) {
+    char *rt = search_include_paths("__g2rt.h");
+    if (!rt)
+      error("__g2rt.h not found in the include path; it should be installed"
+            " in the include directory next to chibicc-g2");
+    tok = append_tokens(tok, must_tokenize_file(rt));
+  }
+
   // Tokenize and parse.
   Token *tok2 = must_tokenize_file(base_file);
   tok = append_tokens(tok, tok2);
@@ -429,8 +439,8 @@ int main(int argc, char **argv) {
   if (!endswith(base_file, ".c") && !opt_E)
     error("<command line>: unknown file extension: %s", base_file);
 
-  // The output is always a g2 assembly file, foo.c -> foo.g2asm.
+  // The output is always a g2 assembly file, foo.c -> foo.g2.
   // With -E, preprocessed C is written to stdout unless -o is given.
-  compile(opt_o ? opt_o : replace_extn(base_file, ".g2asm"));
+  compile(opt_o ? opt_o : replace_extn(base_file, ".g2"));
   return 0;
 }

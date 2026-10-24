@@ -19,7 +19,7 @@ import g2run
 
 def run_test(path, compiler, assembler, include, workdir):
     base = os.path.join(workdir, os.path.splitext(os.path.basename(path))[0])
-    asm, binary = base + '.g2asm', base + '.g2b'
+    asm, binary = base + '.g2', base + '.g2b'
 
     with open(path) as f:
         first_line = f.readline().strip()

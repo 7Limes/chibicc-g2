@@ -1,7 +1,7 @@
 # Plan: Retargeting chibicc to g2 Assembly
 
 This plan covers turning this chibicc fork into a compiler that turns a subset of C into readable
-g2 assembly (the `g2asm` text format). It does not produce `.g2b` binaries; the g2 assembler does that.
+g2 assembly (`.g2` text files). It does not produce `.g2b` binaries; the g2 assembler does that.
 
 References: `g2asm-spec.md`, `g2-spec.md`, `example/snake_g1.c`, `example/g2.h`.
 
@@ -11,7 +11,7 @@ References: `g2asm-spec.md`, `g2-spec.md`, `example/snake_g1.c`, `example/g2.h`.
 
 ### Goals
 
-- Compile one C translation unit (plus headers) into one `.g2asm` file that the g2 assembler accepts.
+- Compile one C translation unit (plus headers) into one `.g2` file that the g2 assembler accepts.
 - Support the C subset that `example/snake_g1.c` uses, plus the obvious neighbours: integers, pointers,
   arrays, functions, the usual control flow, globals, and string/char literals.
 - Expose g2 features in C: the drawing instructions (`col`, `pix`), reserved memory (keys, delta time),
@@ -186,13 +186,10 @@ extern const int DELTA    __attribute__((address(11)));
 #define G2_LOAD(name, op, type, data) extern const int name[]
 #endif
 
-// Standard library (static so unused functions are removed; see §8)
-static void hexcolor(int c);
-static void seed_rand(int seed);
-static int  next_rand(void);
-static void int_to_str(int *buf, int n);
-static void draw_text(int *str, int *font, int size, int x, int y);
-#include "g2lib.c"   // or put the definitions inline here
+// Standard library (static functions, so unused ones are removed; see §8)
+#ifndef G2_NO_STDLIB
+#include <g2lib.h>
+#endif
 
 #endif
 ```
@@ -249,8 +246,8 @@ In practice the first error only happens without `g2.h`, because the header alwa
 ### 4.1 `main.c`: driver
 
 - Remove the assembler and linker steps (`assemble`, `run_linker`, `find_libpath`, `find_gcc_libpath`,
-  `-c`, the `.o` and `.a` handling). The only outputs are `.g2asm`, or preprocessed text with `-E`.
-- Default output: `foo.c` → `foo.g2asm`. Keep `-o`, `-E`, `-I`, `-D`, `-U`, `-include`, `-M*`,
+  `-c`, the `.o` and `.a` handling). The only outputs are `.g2`, or preprocessed text with `-E`.
+- Default output: `foo.c` → `foo.g2`. Keep `-o`, `-E`, `-I`, `-D`, `-U`, `-include`, `-M*`,
   `-fcommon` (harmless), `-###`, and `-cc1` (or drop the cc1 subprocess split and compile in-process,
   which is simpler).
 - New flags: `-mmemory=N` to reserve extra memory beyond what the compiler needs, and `-fno-overlay`
@@ -707,10 +704,16 @@ being removed from the spec.
 | `a & -2^k` | `divi t a 2^k; muli d t 2^k` |
 | any other `&`, `\|`, `^`, `<<`, `>>` | call `__g2_and(a,b)`, `__g2_or`, `__g2_xor`, `__g2_shl`, `__g2_shr` |
 
-The helpers live in `include/__g2rt.h`. They are written in the C subset as `static` functions
-(32-iteration bit loops using `/2` and `%2`, with care for the sign bit) and are auto-included by the
-driver. Do the lowering **in the parser** (or in a small AST pass after parsing) so the inserted calls
-show up in `refs`, which makes liveness, frame allocation and the call graph work for them.
+The helpers live in `include/__g2rt.h`, which the driver includes in every translation unit. They
+are written in the C subset as `static` functions: bit loops using `/2` and `%2`, which work for
+negative numbers because they floor. They stop early once the rest of the result is known, for
+example when one operand's remaining bits are all 0 or all 1.
+
+The lowering is an AST pass at the start of `codegen()` (`lower_bitwise`), not part of the parser.
+That way the "can this be inline?" decision lives in one place next to the code that emits the
+inline forms. The pass rewrites each remaining bitwise node into an `ND_FUNCALL` and marks the
+helper live before frames are laid out, so the helper gets a frame and appears in the call graph
+like any other function. `x op= y` with a bitwise `op` is handled the same way.
 
 ### 6.7 Intrinsics
 
@@ -867,33 +870,32 @@ __L7_end:
 
 ---
 
-## 8. Standard Library (`g2.h` / `g2lib.c`)
+## 8. Standard Library (`g2.h` / `g2lib.h`)
 
-`snake_g1.c` calls `hexcolor`, `seed_rand`, `next_rand`, `int_to_str` and `draw_text`, which are not
-declared anywhere yet. chibicc correctly rejects implicit declarations. Because there is no linker,
-the library is **header-only C** that `g2.h` includes. Every function is `static`, so liveness (§4.4)
-strips the ones a program doesn't use.
+Because there is no linker, the library is **header-only C** in `include/g2lib.h`, which `g2.h`
+includes unless `G2_NO_STDLIB` is defined first. Every function is `static`, so liveness (§4.4)
+strips the ones a program doesn't call, and unused `static` globals (such as the random number
+state) are dropped too.
 
-Sketches that rely on g2 semantics:
+The library is a translation of the Dry standard library (`~/dev/c/dry/stdlib`). On the same
+inputs it produces the same results: a Dry program and the equivalent C program, both calling
+`hexcolor`, `next_rand`, `int_to_str`, `draw_text`, `rect` and `line`, draw identical pixels
+(positions and colours) frame after frame.
 
-```c
-static void hexcolor(int c) {             // c = 0xRRGGBB, non-negative
-    color(c / 65536, (c / 256) % 256, c % 256);
-}
+| Function | Notes |
+|---|---|
+| `min(a, b)`, `max(a, b)` | Return the result (Dry stores it through a pointer). |
+| `seed_rand(seed)`, `next_rand()` | Multiplicative LCG: `x = x * 1583458089 % 2147483647`, with g2's wrapping multiply. `next_rand()` returns the value, as `snake_g1.c` expects (Dry's version takes a pointer). A seed of 0 always gives 0. |
+| `hexcolor(0xRRGGBB)` | Sets the colour. |
+| `int_to_str(dest, x)` | Writes a **length-prefixed** string: `dest[0]` is the length and `dest[1..]` are the digits, with a leading `-` for negative numbers. `dest` needs 12 slots. |
+| `draw_text(str, font, size, x, y)` | Draws a length-prefixed string. A font holds `size`×`size` glyphs starting at the space character (32), packed 32 pixels per slot, low bit first. Each glyph fills its rows right to left, top to bottom. Characters are 1 pixel apart. Each glyph takes `size * size / 32` slots, where Dry uses `size / 4`. The two agree for the 8×8 font, and only the first is right for other sizes. |
+| `rect(x, y, w, h)`, `line(x0, y0, x1, y1)` | Filled rectangle and Bresenham line. |
 
-static int __rand_state;
-static void seed_rand(int seed) { __rand_state = seed; }
-static int next_rand(void) {              // LCG; mul wraps mod 2^32 on g2
-    __rand_state = __rand_state * 1103515245 + 12345;
-    return (__rand_state / 65536) % 32768; // floor div/mod => always in [0, 32767]
-}
+Strings use the same layout as the assembler's `load … string` data, so text loaded with
+`G2_LOAD(MSG, raw, string, "…")` can be passed straight to `draw_text`. C string literals are
+still NUL-terminated `char` arrays, so they can't be passed directly.
 
-static void int_to_str(int *buf, int n);  // decide: NUL-terminated or length-prefixed
-static void draw_text(int *str, int *font, int size, int x, int y);  // depends on the .font format
-```
-
-`draw_text` depends on the layout of `code8x8.font` (bit-packed rows from `pack`?), which you define.
-It will need bit tests, which can be written as `(row / 2^(7-col)) % 2` without bitwise helpers.
+Defining a function with one of these names is a redefinition error unless `G2_NO_STDLIB` is set.
 
 ---
 
@@ -922,7 +924,7 @@ Each phase ends with a milestone program that has to assemble and run on the rea
 1. Create a branch. Delete `codegen.c`'s x86 code and add an empty `codegen_g2.c` with the same
    `codegen(Obj *prog, FILE *out)` entry point. Update the `Makefile`: drop the stage2 and self-hosting
    targets, and drop the x86 test targets.
-2. `main.c`: remove assembler and linker steps, set default output `.g2asm`, and remove host include paths.
+2. `main.c`: remove assembler and linker steps, set default output `.g2`, and remove host include paths.
 3. `type.c`: all scalar and pointer sizes become 1. `init_data` becomes `int32_t*`, with `write_buf`
    fixed to match.
 4. `preprocess.c`: new predefined macros.
@@ -986,11 +988,24 @@ edges. Notes:
 
 ### Phase 3: Library and bitwise
 
-1. `g2lib.c`: `hexcolor`, `seed_rand`, `next_rand`, `int_to_str`, `draw_text`.
+1. `g2lib.h`: `hexcolor`, `seed_rand`, `next_rand`, `int_to_str`, `draw_text`.
 2. Constant shift/mask lowering, plus the `__g2rt.h` helpers and the parser lowering to helper calls.
 3. Dropping unreferenced string literal globals.
 
 *Milestone:* snake shows its score with the font.
+
+*Status:* done. Notes:
+
+- The library is translated from Dry's standard library (§8). It adds `min`, `max`, `rect` and
+  `line`, and pixel comparisons against the Dry originals match exactly.
+- Bitwise operators: the forms in §6.6 compile inline. Other cases call `__g2_and`, `__g2_or`,
+  `__g2_xor`, `__g2_shl` or `__g2_shr`. The lowering happens at the start of codegen, not in the
+  parser (§6.6). A generated test with 893 assertions checks them against host 32-bit results.
+- Anonymous globals (string literals, static locals) and `static` globals that live code doesn't
+  reference are not emitted.
+- Snake (with `G2_LOAD` and `WIDTH`/`HEIGHT` moved above the include) draws its score with the 8×8
+  font. It is 241 instructions and 238 slots, and only the 5 library functions it calls are
+  emitted.
 
 ### Phase 4: Quality and memory
 
@@ -1023,7 +1038,7 @@ Build a new one:
 2. **`test-g2/*.c` in chibicc's `ASSERT` style.** `test-g2/test.h` provides
    `static void assert_eq(int line, int expected, int actual)`, which on failure records
    `__test_fail_line = line` (a global). Each test does its work in `start()`, so a single frame is enough. The runner reads the
-   `define` table from the `.g2asm` to find `g_test_fail_line`, and a non-zero value means failure.
+   `define` table from the `.g2` to find `g_test_fail_line`, and a non-zero value means failure.
    Port the relevant tests over: `arith.c`, `control.c`, `pointer.c`, `function.c`, `string.c`,
    `struct.c`, `sizeof.c` (with new expected sizes), `initializer.c`, `literal.c`, `usualconv.c`.
 3. **Semantics tests specific to g2:** floor division and mod on negatives (`-7/2 == -4`, `-1%64 == 63`),
@@ -1033,7 +1048,7 @@ Build a new one:
    overlay on.
 4. **Error tests:** each rejected feature gives its diagnostic (`test-g2/errors/*.c` plus expected
    message substrings).
-5. **Golden-output tests (optional):** check in the `.g2asm` for a few small programs so codegen changes
+5. **Golden-output tests (optional):** check in the `.g2` for a few small programs so codegen changes
    show up as diffs.
 6. `make test` runs all of the above.
 
@@ -1153,14 +1168,14 @@ These are things noticed while planning, not compiler requirements:
 
 | File | Change |
 |---|---|
-| `main.c` | Remove the as/ld pipeline and host include paths. Add `.g2asm` output, `-mmemory`/`-fno-overlay`, and window metadata through `window_dimension()`. |
+| `main.c` | Remove the as/ld pipeline and host include paths. Add `.g2` output, `-mmemory`/`-fno-overlay`, and window metadata through `window_dimension()`. |
 | `preprocess.c` | New predefined macros, `window_dimension()` (constant-expression evaluation of `WIDTH`/`HEIGHT`), and the macro redefinition warning. |
 | `tokenize.c` | Remove float literals. 32-bit int literals with a wrap warning. Keep raw string spelling. |
 | `parse.c` | Feature rejection, attributes (`address`, `g2_intrinsic`, `g2_load`), lazy `__func__`, 32-bit floor `eval`, `int32_t` init buffer, `start`/`tick` roots, bitwise lowering into runtime helper calls, removal of the alloca/va-area/struct-return locals. |
 | `type.c` | All scalar and pointer sizes 1. Remove float conversions. |
 | `chibicc.h` | New `Obj` fields (fixed address, intrinsic, load info, addr/asm_name/frame_size). Remove x86 fields. Add the new codegen API. |
 | `codegen.c` → `codegen_g2.c` | Rewritten: memory allocator, frame allocation and overlay, call graph checks, operand-based expression and condition codegen, statement codegen, initialisers, peephole pass, output formatting. |
-| `include/` | Replace with `stddef.h`, `stdbool.h`, `limits.h`, `g2.h`, `__g2rt.h`. Add `g2lib.c`. |
+| `include/` | Replace with `stddef.h`, `stdbool.h`, `limits.h`, `g2.h`, `__g2rt.h`, `g2lib.h`. |
 | `Makefile` | Drop stage2 and the x86 tests. Add the `test-g2` target and the runner. |
 | `test-g2/`, `tools/` | New test suite and headless runner (§11). |
-| `example/g2.h` | Use the attributes and pull in the library (§3.6). |
+| `example/g2.h` | Superseded by `include/g2.h`, which uses the attributes and pulls in the library (§3.6). |

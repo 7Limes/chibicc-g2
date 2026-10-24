@@ -914,6 +914,249 @@ static Operand gen_ternary(Node *node, Operand *hint) {
   return d;
 }
 
+//
+// Bitwise operators
+//
+// g2 has no bitwise instructions. With a constant operand, shifts and
+// many masks are a multiplication, division or remainder by a power of
+// two, because g2's division rounds toward negative infinity:
+//
+//   x << k   x * 2^k
+//   x >> k   x / 2^k (an arithmetic shift)
+//   x & m    x % (m + 1)            if m + 1 is a power of two
+//   x & -m   x / m * m              if m is a power of two
+//
+// Everything else is rewritten into a call to a runtime helper in
+// __g2rt.h (see lower_bitwise).
+
+static bool is_bitwise(NodeKind kind) {
+  return kind == ND_BITAND || kind == ND_BITOR || kind == ND_BITXOR ||
+         kind == ND_SHL || kind == ND_SHR;
+}
+
+static bool is_commutative(NodeKind kind) {
+  return kind == ND_BITAND || kind == ND_BITOR || kind == ND_BITXOR;
+}
+
+// Returns log2(k) if k is a power of two, or -1.
+static int log2_exact(int64_t k) {
+  if (k <= 0 || (k & (k - 1)))
+    return -1;
+  int n = 0;
+  while (k > 1) {
+    k /= 2;
+    n++;
+  }
+  return n;
+}
+
+// Returns true if `kind` with the constant operand `k` compiles inline.
+static bool bitwise_inline(NodeKind kind, int64_t k) {
+  switch (kind) {
+  case ND_SHL:
+  case ND_SHR:
+    return true; // out-of-range counts are reported by gen_bitwise
+  case ND_BITAND: {
+    if (k == 0 || k == -1)
+      return true;
+    int n = (k > 0) ? log2_exact(k + 1) : log2_exact(-k);
+    return 0 < n && n <= 30;
+  }
+  case ND_BITOR:
+  case ND_BITXOR:
+    return k == 0 || k == -1;
+  }
+  unreachable();
+}
+
+static bool bitwise_needs_helper(Node *node) {
+  int64_t a, b;
+  bool lhs_const = const_int(node->lhs, &a);
+  bool rhs_const = const_int(node->rhs, &b);
+  if (lhs_const && rhs_const)
+    return false;
+  if (rhs_const && bitwise_inline(node->kind, b))
+    return false;
+  if (lhs_const && is_commutative(node->kind) && bitwise_inline(node->kind, a))
+    return false;
+  return true;
+}
+
+static Operand gen_bitwise(Node *node, Operand *hint) {
+  Operand a = gen_expr(node->lhs, NULL);
+  Operand b = gen_expr(node->rhs, NULL);
+
+  if (a.is_imm && b.is_imm)
+    return imm(fold(node, a.imm, b.imm));
+
+  if (is_commutative(node->kind) && a.is_imm) {
+    Operand tmp = a;
+    a = b;
+    b = tmp;
+  }
+
+  // lower_bitwise turned every other case into a helper call.
+  if (!b.is_imm || !bitwise_inline(node->kind, b.imm))
+    unreachable();
+
+  int32_t k = b.imm;
+  Operand d;
+
+  switch (node->kind) {
+  case ND_SHL:
+  case ND_SHR:
+    if (k < 0 || k > 31)
+      error_tok(node->rhs->tok, "shift count out of range (0..31): %d", k);
+    if (k == 0)
+      return a;
+    free_op(a);
+    d = dest(hint);
+    if (node->kind == ND_SHL && k <= 30) {
+      emit("muli %s %s %d", d.name, a.name, 1 << k);
+    } else if (node->kind == ND_SHL) {
+      // x << 31 keeps only the lowest bit, which becomes the sign bit.
+      emit("modi %s %s 2", d.name, a.name);
+      emit("muli %s %s -2147483648", d.name, d.name);
+    } else if (k <= 30) {
+      emit("divi %s %s %d", d.name, a.name, 1 << k);
+    } else {
+      // 2^31 isn't representable, so divide twice.
+      emit("divi %s %s 1073741824", d.name, a.name);
+      emit("divi %s %s 2", d.name, d.name);
+    }
+    return d;
+  case ND_BITAND:
+    if (k == 0) {
+      free_op(a);
+      return imm(0);
+    }
+    if (k == -1)
+      return a;
+    free_op(a);
+    d = dest(hint);
+    if (k > 0) {
+      emit("modi %s %s %d", d.name, a.name, k + 1);
+    } else {
+      emit("divi %s %s %d", d.name, a.name, -k);
+      emit("muli %s %s %d", d.name, d.name, -k);
+    }
+    return d;
+  case ND_BITOR:
+    if (k == 0)
+      return a;
+    free_op(a);
+    return imm(-1);
+  case ND_BITXOR:
+    if (k == 0)
+      return a;
+    free_op(a);
+    d = dest(hint);
+    emit("sub %s %s %s", d.name, SLOT_MINUS_ONE, a.name);
+    return d;
+  }
+  unreachable();
+}
+
+static HashMap helper_fns; // name -> Obj for the functions in __g2rt.h
+
+static char *helper_name(NodeKind kind) {
+  switch (kind) {
+  case ND_BITAND: return "__g2_and";
+  case ND_BITOR: return "__g2_or";
+  case ND_BITXOR: return "__g2_xor";
+  case ND_SHL: return "__g2_shl";
+  case ND_SHR: return "__g2_shr";
+  }
+  unreachable();
+}
+
+// Rewrites bitwise operators that can't be compiled inline into calls to
+// the runtime helpers, and marks the helpers live. This happens before
+// any code is generated, so the helpers get frames and appear in the
+// call graph like any other function.
+static bool lower_bitwise(Node *node) {
+  if (!node)
+    return false;
+
+  bool changed = false;
+  changed |= lower_bitwise(node->lhs);
+  changed |= lower_bitwise(node->rhs);
+  changed |= lower_bitwise(node->cond);
+  changed |= lower_bitwise(node->then);
+  changed |= lower_bitwise(node->els);
+  changed |= lower_bitwise(node->init);
+  changed |= lower_bitwise(node->inc);
+  for (Node *n = node->body; n; n = n->next)
+    changed |= lower_bitwise(n);
+  for (Node *n = node->args; n; n = n->next)
+    changed |= lower_bitwise(n);
+
+  if (!is_bitwise(node->kind) || !bitwise_needs_helper(node))
+    return changed;
+
+  char *name = helper_name(node->kind);
+  Obj *fn = hashmap_get(&helper_fns, name);
+  if (!fn)
+    error_tok(node->tok, "this operator needs the runtime helper %s, which is"
+              " defined in __g2rt.h", name);
+
+  Node *callee = calloc(1, sizeof(Node));
+  callee->kind = ND_VAR;
+  callee->var = fn;
+  callee->tok = node->tok;
+  callee->ty = fn->ty;
+
+  Node *a = node->lhs;
+  Node *b = node->rhs;
+  a->next = b;
+  b->next = NULL;
+
+  node->kind = ND_FUNCALL;
+  node->lhs = callee;
+  node->rhs = NULL;
+  node->args = a;
+  node->func_ty = fn->ty;
+
+  bool was_live = fn->is_live;
+  fn->is_live = true;
+  return changed || !was_live;
+}
+
+//
+// Unused globals
+//
+
+// Marks the globals that live code refers to. Anonymous globals (string
+// literals and static locals) and static globals that aren't used are not
+// emitted, so e.g. the library's random number state costs nothing in a
+// program that doesn't use it.
+static void mark_used(Node *node) {
+  if (!node)
+    return;
+  if (node->kind == ND_VAR && !node->var->is_local)
+    node->var->is_used = true;
+
+  mark_used(node->lhs);
+  mark_used(node->rhs);
+  mark_used(node->cond);
+  mark_used(node->then);
+  mark_used(node->els);
+  mark_used(node->init);
+  mark_used(node->inc);
+  for (Node *n = node->body; n; n = n->next)
+    mark_used(n);
+  for (Node *n = node->args; n; n = n->next)
+    mark_used(n);
+}
+
+static bool is_anonymous(Obj *var) {
+  return !strncmp(var->name, ".L..", 4);
+}
+
+static bool droppable(Obj *var) {
+  return is_anonymous(var) || var->is_static;
+}
+
 static FnInfo *find_fn_info(Obj *fn) {
   return hashmap_get(&fn_infos, fn->name);
 }
@@ -1113,15 +1356,8 @@ static Operand gen_expr(Node *node, Operand *hint) {
   case ND_BITOR:
   case ND_BITXOR:
   case ND_SHL:
-  case ND_SHR: {
-    // Constant expressions are folded. Everything else needs runtime
-    // helpers, which come later.
-    Operand a = gen_expr(node->lhs, NULL);
-    Operand b = gen_expr(node->rhs, NULL);
-    if (a.is_imm && b.is_imm)
-      return imm(fold(node, a.imm, b.imm));
-    unsupported(node, "bitwise and shift operators");
-  }
+  case ND_SHR:
+    return gen_bitwise(node, hint);
   }
 
   error_tok(node->tok, "invalid expression");
@@ -1543,6 +1779,48 @@ void codegen(Obj *prog, int width, int height, FILE *outfile) {
   for (Obj *obj = prog; obj; obj = obj->next)
     objs[--k] = obj;
 
+  // Lower bitwise operators to helper calls. Repeat while new helpers
+  // become live, since they need lowering too.
+  for (int i = 0; i < nobjs; i++)
+    if (objs[i]->is_function && objs[i]->is_definition && !strncmp(objs[i]->name, "__g2_", 5))
+      hashmap_put(&helper_fns, objs[i]->name, objs[i]);
+
+  for (bool changed = true; changed;) {
+    changed = false;
+    for (int i = 0; i < nobjs; i++) {
+      Obj *fn = objs[i];
+      if (fn->is_function && fn->is_definition && fn->is_live)
+        changed |= lower_bitwise(fn->body);
+    }
+  }
+
+  // Find the globals that are used, by live code or by the initializers
+  // of used globals.
+  HashMap all_globals = {};
+  for (int i = 0; i < nobjs; i++)
+    if (!objs[i]->is_function)
+      hashmap_put(&all_globals, objs[i]->name, objs[i]);
+
+  for (int i = 0; i < nobjs; i++)
+    if (objs[i]->is_function && objs[i]->is_definition && objs[i]->is_live)
+      mark_used(objs[i]->body);
+
+  for (bool changed = true; changed;) {
+    changed = false;
+    for (int i = 0; i < nobjs; i++) {
+      Obj *var = objs[i];
+      if (var->is_function || (droppable(var) && !var->is_used))
+        continue;
+      for (Relocation *rel = var->rel; rel; rel = rel->next) {
+        Obj *target = hashmap_get(&all_globals, *rel->label);
+        if (target && !target->is_used) {
+          target->is_used = true;
+          changed = true;
+        }
+      }
+    }
+  }
+
   // Globals that need memory, in source order.
   Obj **globals = calloc(nobjs + 1, sizeof(Obj *));
   int nglobals = 0;
@@ -1561,6 +1839,8 @@ void codegen(Obj *prog, int width, int height, FILE *outfile) {
       continue;
     }
     if (obj->has_fixed_addr || obj->is_load || !obj->is_definition)
+      continue;
+    if (droppable(obj) && !obj->is_used)
       continue;
     globals[nglobals++] = obj;
     need_init = need_init || has_initializer(obj);
@@ -1586,7 +1866,7 @@ void codegen(Obj *prog, int width, int height, FILE *outfile) {
     Obj *var = globals[i];
     if (var->is_str_lit)
       var->asm_name = unique_asm_name(format("__str%d", nstr++));
-    else if (!strncmp(var->name, ".L..", 4))
+    else if (is_anonymous(var))
       var->asm_name = unique_asm_name(format("__anon%d", nanon++));
     else
       var->asm_name = unique_asm_name(format("g_%s", c_ident(var->name)));

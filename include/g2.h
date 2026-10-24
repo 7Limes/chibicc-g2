@@ -43,4 +43,12 @@ extern const int DELTA __attribute__((address(11)));
 #define G2_LOAD(name, op, type, data) extern const int name[]
 #endif
 
+// The standard library: min, max, seed_rand, next_rand, hexcolor,
+// int_to_str, rect, line and draw_text. Define G2_NO_STDLIB before
+// including this header to leave it out, e.g. to define functions with
+// the same names.
+#ifndef G2_NO_STDLIB
+#include <g2lib.h>
+#endif
+
 #endif

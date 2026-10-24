@@ -7,7 +7,7 @@
 /thirdparty
 /chibicc
 /chibicc-g2
-*.g2asm
+/*.g2
 /test/*.exe
 /stage2
 __pycache__/

@@ -160,6 +160,7 @@ struct Obj {
   char *intrinsic;
 
   // g2 backend
+  bool is_used;   // an anonymous global that live code refers to
   char *asm_name; // name of the slot (define) or label in the output
   int addr;       // absolute memory address of a variable
 

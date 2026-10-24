@@ -8,7 +8,7 @@ reference VM (cg2).
 
 Example:
     g2run.py prog.g2b --frames 10 --press RIGHT:0-4 \\
-        --symbols prog.g2asm --print g_x --print g_arr:4 --pixels
+        --symbols prog.g2 --print g_x --print g_arr:4 --pixels
 """
 
 import argparse
@@ -176,7 +176,7 @@ def main():
     parser.add_argument('--delta', type=int, default=16, help='delta time in ms')
     parser.add_argument('--max-steps', type=int, default=10_000_000,
                         help='maximum instructions per frame')
-    parser.add_argument('--symbols', help='.g2asm file to read define names from')
+    parser.add_argument('--symbols', help='.g2 file to read define names from')
     parser.add_argument('--print', action='append', default=[], metavar='NAME[:COUNT]',
                         help='print a memory value by define name or address')
     parser.add_argument('--pixels', action='store_true', help='print pixels drawn in the last frame')
