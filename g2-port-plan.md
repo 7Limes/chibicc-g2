@@ -148,7 +148,7 @@ An optional `-mc-division` flag could emit truncating sequences for strict C. Th
 | Reserved memory | `UP`, `DOWN`, … `DELTA` | New `__attribute__((address(N)))` on a global declaration. The global is bound to a fixed address and not allocated. Declare them `const` so assignments are rejected. |
 | Window size | `#define WIDTH 64` / `#define HEIGHT 64`, placed **before** `#include "g2.h"` | After preprocessing, the compiler evaluates the final values of the `WIDTH` and `HEIGHT` macros as constant expressions and emits `#width`/`#height` (§3.7). There are no separate CLI flags; use `-DWIDTH=N`. |
 | Memory size | (none) | `#memory` is set to the end of the compiler's own allocation (§5.1). The assembler appends `load` data after it. `-mmemory=N` overrides it, and an error is reported if N is too small. |
-| Data loading | `load FONT pack file "code8x8.font";` | New top-level declaration (§4.4). `FONT` acts like `extern int FONT[]`, and the statement is copied into the output as-is. |
+| Data loading | `G2_LOAD(FONT, pack, file, "code8x8.font");` | A macro from `g2.h` that expands to `extern const int FONT[]` with a `g2_load(...)` attribute (§4.4). It is valid C, so editors and language servers accept it. The compiler emits a `load` statement for it, and `FONT` acts like any `const int` array. |
 
 Updated `example/g2.h` using these attributes:
 
@@ -177,6 +177,14 @@ extern const int DOWN     __attribute__((address(8)));
 extern const int LEFT     __attribute__((address(9)));
 extern const int RIGHT    __attribute__((address(10)));
 extern const int DELTA    __attribute__((address(11)));
+
+// Loaded data (§4.4). Editors and other tools see a plain declaration.
+#ifdef __g2__
+#define G2_LOAD(name, op, type, data) \
+  extern const int name[] __attribute__((g2_load(#op, #type, data)))
+#else
+#define G2_LOAD(name, op, type, data) extern const int name[]
+#endif
 
 // Standard library (static so unused functions are removed; see §8)
 static void hexcolor(int c);
@@ -283,11 +291,10 @@ In practice the first error only happens without `g2.h`, because the header alwa
 - `convert_pp_int`: give every literal type `int`, warn on wrap-around in `[2^31, 2^32)`, and error above
   that. Drop the `u`/`U` suffix, or make it an error, to match §3.4.
 - Character literals: `'a'` is an `int` with value 97. Multi-character and wide literals are errors.
-- String literals: each `char` is one slot. `u8"…"`, `u"…"`, `U"…"` and `L"…"` still produce one slot
-  per code unit, which is fine and needs no change. Keep the original spelling (`tok->loc`, `tok->len`)
-  available for `load` statements (§4.4).
-- `load` is **not** a keyword. It is recognised by context in the parser so it stays usable as an
-  identifier elsewhere.
+- String literals: each `char` is one slot. Plain and `u8"…"` strings are supported. `u"…"`, `U"…"`
+  and `L"…"` are rejected, because their buffers depend on byte sizes (done in Phase 0).
+- Nothing changes in the tokenizer for loaded data. `G2_LOAD` is an ordinary macro, and its data
+  argument is an ordinary string literal (§4.4).
 
 ### 4.4 `parse.c`
 
@@ -339,24 +346,48 @@ In practice the first error only happens without `g2.h`, because the header alwa
   - `g2_intrinsic("col"|"pix")` on a function declaration: sets `fn->intrinsic`. The parameter count
     must match the instruction (3 for `col`, 2 for `pix`). The function must not have a body.
 
-**`load` statement (new top-level form):**
+**Loaded data: the `g2_load` attribute.**
+
+Data that the assembler loads into memory is declared through a macro from `g2.h`, so the source
+stays valid C that editors and language servers understand:
+
+```c
+G2_LOAD(FONT, pack, file, "code8x8.font");
+G2_LOAD(GREETING, raw, string, "Hello, world");
+```
+
+With `__g2__` defined (the compiler), the macro expands to
+`extern const int FONT[] __attribute__((g2_load("pack", "file", "code8x8.font")));`. Any other
+tool sees only `extern const int FONT[];`, so `FONT` has a real type, completion works, and
+passing it to `draw_text(..., FONT, ...)` type-checks.
 
 ```
-load-decl = "load" ident ident ident string-literal ";"
-            ; NAME   OPERATION  DATA_TYPE  DATA_STRING
+decl-attr = ... | "g2_load" "(" string-literal "," string-literal "," string-literal ")"
+                                 ; OPERATION     DATA_TYPE        DATA
 ```
 
-- In `parse()`, before `declspec`: if `tok` is the identifier `load`, the next three tokens are
-  identifiers, and the fourth is a string literal, parse a load declaration.
-- Check the operation against `raw|pack` and the data type against `file|bytes|string`.
-- Create a global `Obj`: `name = NAME`, `ty = array_of(ty_int, 0)` (incomplete, so it decays to
-  `int *`), `is_load = true`, `is_definition = false`. Also store `load_op`, `load_type`, and
-  `load_data`, which is the **raw spelling** of the string token copied from `tok->loc`/`tok->len`
-  so the assembler sees exactly what the user wrote.
-- Using `FONT` as a value gives its address (`ldi t FONT`). Assigning to it is an error (array type).
-- `file` paths: a relative path is relative to the assembler's working directory, which may not be the
-  source directory. Add an option `-mload-relative` that rewrites relative paths to be relative to the
-  `.c` file. The default is to leave paths unchanged.
+- Parse it in `decl_attribute_list` next to `address` and `g2_intrinsic`, and store the three strings
+  in `DeclAttr`. In `global_variable()`, a `g2_load` attribute sets `var->is_load` and the `load_op`,
+  `load_type` and `load_data` fields.
+- Checks, each an error at the attribute:
+  - The operation is `raw` or `pack`, and the data type is `file`, `bytes` or `string`.
+  - The declared type is an array of `int` (or `char`) with no initializer. `extern` is expected, and
+    the size may be left out. `g2_load` cannot be combined with `address`.
+  - `file`: the file must exist. A relative path is resolved relative to the `.c` file and emitted as
+    that path, because the assembler would otherwise resolve it against its own working directory.
+  - `string`: the assembler encodes the string as ASCII and doesn't process escape sequences, so the
+    text must be printable ASCII. The text is taken from the processed literal (`tok->str`), so a C
+    escape such as `\"` is allowed as long as the result is representable (see the next point).
+  - The assembler reads quoted data with the pattern `(['"`])(.*)\1`. The compiler emits the data with
+    whichever of `"`, `'` or `` ` `` doesn't occur in it, and reports an error if all three do.
+  - `bytes`: see §13. The assembler can't currently parse `bytes` data, so this is an error until the
+    expected format is settled.
+- The variable is a global like any other. It is named `g_<name>` (§5.2), but it isn't allocated: in
+  the output it becomes `load g_FONT pack file "/abs/path/code8x8.font"` in the header, and the
+  assembler binds `g_FONT` to the address where the data ends up (at or above `#memory`, §5.1).
+- Using `FONT` gives its address (`ldi t g_FONT`), so `FONT[i]`, `*FONT` and passing `FONT` to a
+  function work like any array. Writing to it is rejected through `const` (Phase 2, item 5).
+- Several declarations of the same loaded name must agree. The assembler is given one `load`.
 
 **Liveness and roots (reusing `mark_live`/`refs`):**
 
@@ -378,7 +409,7 @@ load-decl = "load" ident ident ident string-literal ";"
 - `add_type()`: drop the "usual arithmetic conversion" paths for floats. `get_common_type` always
   returns `ty_int` for integers and keeps pointers as pointers.
 - `struct Obj` gains: `bool has_fixed_addr; int fixed_addr;`, `char *intrinsic;`,
-  `bool is_load; char *load_op, *load_type, *load_data;`, and backend fields `int addr;`
+  `bool is_load; char *load_op, *load_type, *load_data;` (from `g2_load`), and backend fields `int addr;`
   (absolute slot address) and `char *asm_name;` (emitted symbol).
 - `struct Obj` loses (or ignores): `offset` (replaced by `addr`), `va_area`, `alloca_bottom`,
   `stack_size` (replaced by `frame_size`), `is_tls`.
@@ -441,7 +472,7 @@ Every slot gets a `define` so the assembly reads well:
 | Compiler globals | `__g2_<name>` | `define __g2_started 32` |
 | Function label | `fn_<name>` (including `fn_start`, `fn_tick`) | `fn_move_snake:` |
 | Internal label | `__L<N>_<what>` (codegen), `__C<N>` (chibicc's `break`/`continue`/`goto` labels), `__g2_entry_*`, `__g2_end` | `__L12_else:` |
-| Load data | `<NAME>` exactly as written (it is the user's own symbol) | `load FONT pack file "..."` |
+| Loaded data (`G2_LOAD`) | `g_<name>`, like any global | `load g_FONT pack file "..."` |
 
 g2 identifiers follow C's identifier rules, so every mangled name above is valid as it is. Labels have
 their own namespace. **Defines and load names share a namespace**, so:
@@ -455,10 +486,11 @@ their own namespace. **Defines and load names share a namespace**, so:
 
 - Function labels (`fn_*`, `__L*`) cannot clash with any define or load name.
 - The prefixes keep defines from clashing with mnemonics (`add`, `col`, `pix` …) and with each other.
-- The one remaining risk is a user `load` name equal to an emitted define, for example a load named
-  `g_score` next to a C global `score`, or a load named `__g2_started`. The compiler checks every load
-  name against the set of emitted defines and reports an error on a match. (A load name equal to a C
-  identifier is already rejected by the C parser as a redeclaration.) Operands that are a known address plus a constant offset
+- Loaded data gets a mangled name too. The C code only refers to it through the compiler, so the
+  assembly name doesn't need to match the C name. That way it can't collide with another define, with
+  the assembler's predefined constants (`A`, `UP`, …; see §13), or with the keyword prefixes above.
+
+Operands that are a known address plus a constant offset
 (`arr[3]`, `s.y`) are emitted as the **numeric address with a comment**: `cpy 35 13 ; g_arr+3`. Defines
 are plain text substitution, so `g_arr+3` would not be evaluated by the assembler.
 
@@ -505,7 +537,7 @@ Notes:
 #height 64
 #memory 431
 
-load FONT pack file "code8x8.font"
+load g_FONT pack file "/home/user/snake/code8x8.font"
 
 ; ---- globals ----
 define __g2_started 32            ; set to 1 once start() has run
@@ -589,7 +621,7 @@ operand is `OP_IMM`, the cheapest form is chosen.
 | `(_Bool)a` | `cmp d a 0; mul d d d` | folded |
 | `k` (constant, needed in a slot) | `0`/`1`/`-1` → reserved slot 0/1/2; otherwise `ldi t k` (or the constant pool) | |
 | `&global`, `&local`, `array` (decay) | `ldi d g_name` | |
-| `&load_sym` / `load_sym` | `ldi d NAME` | |
+| `&load_sym` / `load_sym` (a `G2_LOAD` array) | `ldi d g_NAME`, the same as any array | |
 | `&x + k` | `ldi d <addr+k> ; g_x+k` | |
 | `a, b` | evaluate `a`, discard it, evaluate `b` | |
 
@@ -930,8 +962,8 @@ without `start()` is normal.
    initialisers, arrays and strings included, are already emitted with one `ldi` per non-zero slot.
 5. Enforce `const`. chibicc parses it and then ignores it, so `UP = 1;` currently compiles even
    though `g2.h` declares the keys `const`.
-6. The `load` statement. Also reject load names that clash with the assembler's predefined
-   constants (§13).
+6. Loaded data: the `g2_load` attribute, the `G2_LOAD` macro in `g2.h`, and `load` lines in the output
+   (§4.4). Mangled names avoid clashes with the assembler's predefined constants (§13).
 
 *Milestone:* `snake_g1.c` compiles, given the library functions it needs, and runs.
 
@@ -1044,13 +1076,29 @@ The resolved items are recorded here because the design depends on them.
     which the entry stub satisfies.
   - The assembler predefines the constants `CONTROL1`, `CONTROL2`, `A`, `B`, `UP`, `DOWN`, `LEFT`,
     `RIGHT` and `DELTA` (as addresses). A `load` with one of these names would only produce a
-    warning and keep the predefined value, so the `load` parser (Phase 2) must reject them.
+    warning and keep the predefined value. Loaded data is emitted under mangled `g_` names, so this
+    can't happen (§5.2).
+- **Load syntax.** Loaded data is declared with the `G2_LOAD(name, op, type, data)` macro, which
+  expands to an array declaration with a `g2_load` attribute. It is valid C, so language servers
+  accept it (§4.4).
   - Naming constraints from the lexer are described in §5.2.
 - **Recursion.** It is not required. The fixed-address frame model (§3.2) is the final design.
 
 ### Still open
 
-None. All assembler questions are resolved.
+These are problems in the assembler's `data.py`, found while designing `G2_LOAD`. They don't block the
+compiler, except for `bytes` data:
+
+1. **`bytes` data can't currently be loaded.** The lexer only produces an INT token for it (decimal, or
+   hex with a `0x` prefix). `HEX_REGEX` then expects bare hex pairs, so `0x…` never matches, and
+   `(:?` looks like a typo for `(?:`. Finally, `bytes(bytes_hex)` raises a `TypeError` on a `str`
+   (`bytes.fromhex` was probably intended). Once the intended format is decided, the compiler will
+   emit it from `G2_LOAD(X, raw, bytes, "0102ab")`. Until then, the compiler reports `bytes` as unsupported.
+2. **`pack` pads with ASCII `'0'` bytes (0x30), not zero bytes,** so the last packed value of data whose
+   length isn't a multiple of 4 has `0x30` in its high bytes. `b'\0'` was probably intended.
+3. **The `string` length prefix counts slots, not characters.** It is `len(operation_result)`, which
+   for `pack` is the number of packed values. The spec says it is the string's length. This only
+   matters for `pack string`.
 
 ---
 
@@ -1076,6 +1124,11 @@ These are things noticed while planning, not compiler requirements:
   definition then triggers the new redefinition warning.
 - `int score_str[12]` used as a string buffer works well, because `char` and `int` are the same type
   on g2.
+- `load FONT pack file "code8x8.font";` becomes `G2_LOAD(FONT, pack, file, "code8x8.font");` (§4.4).
+  The path is resolved relative to `snake_g1.c`.
+- `#include "g2.h"` finds `example/g2.h` before the installed `include/g2.h`, because quoted includes
+  search the source file's directory first. Delete the copy in `example/`, or switch to
+  `#include <g2.h>`.
 
 ---
 
@@ -1086,7 +1139,7 @@ These are things noticed while planning, not compiler requirements:
 | `main.c` | Remove the as/ld pipeline and host include paths. Add `.g2asm` output, `-mmemory`/`-fno-overlay`, and window metadata through `window_dimension()`. |
 | `preprocess.c` | New predefined macros, `window_dimension()` (constant-expression evaluation of `WIDTH`/`HEIGHT`), and the macro redefinition warning. |
 | `tokenize.c` | Remove float literals. 32-bit int literals with a wrap warning. Keep raw string spelling. |
-| `parse.c` | Feature rejection, attributes (`address`, `g2_intrinsic`), `load` declarations, lazy `__func__`, 32-bit floor `eval`, `int32_t` init buffer, `start`/`tick` roots, bitwise lowering into runtime helper calls, removal of the alloca/va-area/struct-return locals. |
+| `parse.c` | Feature rejection, attributes (`address`, `g2_intrinsic`, `g2_load`), lazy `__func__`, 32-bit floor `eval`, `int32_t` init buffer, `start`/`tick` roots, bitwise lowering into runtime helper calls, removal of the alloca/va-area/struct-return locals. |
 | `type.c` | All scalar and pointer sizes 1. Remove float conversions. |
 | `chibicc.h` | New `Obj` fields (fixed address, intrinsic, load info, addr/asm_name/frame_size). Remove x86 fields. Add the new codegen API. |
 | `codegen.c` → `codegen_g2.c` | Rewritten: memory allocator, frame allocation and overlay, call graph checks, operand-based expression and condition codegen, statement codegen, initialisers, peephole pass, output formatting. |
