@@ -6,5 +6,7 @@
 /tmp*
 /thirdparty
 /chibicc
+/chibicc-g2
+*.g2asm
 /test/*.exe
 /stage2

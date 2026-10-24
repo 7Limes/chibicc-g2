@@ -75,7 +75,6 @@ struct Token {
   TokenKind kind;   // Token kind
   Token *next;      // Next token
   int64_t val;      // If kind is TK_NUM, its value
-  long double fval; // If kind is TK_NUM, its value
   char *loc;        // Token location
   int len;          // Token length
   Type *ty;         // Used if TK_NUM or TK_STR
@@ -101,7 +100,6 @@ bool consume(Token **rest, Token *tok, char *str);
 void convert_pp_tokens(Token *tok);
 File **get_input_files(void);
 File *new_file(char *name, int file_no, char *contents);
-Token *tokenize_string_literal(Token *tok, Type *basety);
 Token *tokenize(File *file);
 Token *tokenize_file(char *filename);
 
@@ -142,8 +140,7 @@ struct Obj {
 
   // Global variable
   bool is_tentative;
-  bool is_tls;
-  char *init_data;
+  int32_t *init_data; // initial value, one element per memory slot
   Relocation *rel;
 
   // Function
@@ -151,8 +148,6 @@ struct Obj {
   Obj *params;
   Node *body;
   Obj *locals;
-  Obj *va_area;
-  Obj *alloca_bottom;
   int stack_size;
 
   // Static inline function
@@ -208,20 +203,14 @@ typedef enum {
   ND_CASE,      // "case"
   ND_BLOCK,     // { ... }
   ND_GOTO,      // "goto"
-  ND_GOTO_EXPR, // "goto" labels-as-values
   ND_LABEL,     // Labeled statement
-  ND_LABEL_VAL, // [GNU] Labels-as-values
   ND_FUNCALL,   // Function call
   ND_EXPR_STMT, // Expression statement
   ND_STMT_EXPR, // Statement expression
   ND_VAR,       // Variable
-  ND_VLA_PTR,   // VLA designator
   ND_NUM,       // Integer
   ND_CAST,      // Type cast
-  ND_MEMZERO,   // Zero-clear a stack variable
-  ND_ASM,       // "asm"
-  ND_CAS,       // Atomic compare-and-swap
-  ND_EXCH,      // Atomic exchange
+  ND_MEMZERO,   // Zero-clear a local variable
 } NodeKind;
 
 // AST node type
@@ -254,10 +243,8 @@ struct Node {
   // Function call
   Type *func_ty;
   Node *args;
-  bool pass_by_stack;
-  Obj *ret_buffer;
 
-  // Goto or labeled statement, or labels-as-values
+  // Goto or labeled statement
   char *label;
   char *unique_label;
   Node *goto_next;
@@ -270,24 +257,11 @@ struct Node {
   long begin;
   long end;
 
-  // "asm" string literal
-  char *asm_str;
-
-  // Atomic compare-and-swap
-  Node *cas_addr;
-  Node *cas_old;
-  Node *cas_new;
-
-  // Atomic op= operators
-  Obj *atomic_addr;
-  Node *atomic_expr;
-
   // Variable
   Obj *var;
 
   // Numeric literal
   int64_t val;
-  long double fval;
 };
 
 Node *new_cast(Node *expr, Type *ty);
@@ -312,7 +286,6 @@ typedef enum {
   TY_PTR,
   TY_FUNC,
   TY_ARRAY,
-  TY_VLA, // variable-length array
   TY_STRUCT,
   TY_UNION,
 } TypeKind;
@@ -322,7 +295,6 @@ struct Type {
   int size;           // sizeof() value
   int align;          // alignment
   bool is_unsigned;   // unsigned or signed
-  bool is_atomic;     // true if _Atomic
   Type *origin;       // for type compatibility check
 
   // Pointer-to or array-of type. We intentionally use the same member
@@ -341,10 +313,6 @@ struct Type {
 
   // Array
   int array_len;
-
-  // Variable-length array
-  Node *vla_len; // # of elements
-  Obj *vla_size; // sizeof() value
 
   // Struct
   Member *members;
@@ -399,13 +367,12 @@ Type *copy_type(Type *ty);
 Type *pointer_to(Type *base);
 Type *func_type(Type *return_ty);
 Type *array_of(Type *base, int size);
-Type *vla_of(Type *base, Node *expr);
 Type *enum_type(void);
 Type *struct_type(void);
 void add_type(Node *node);
 
 //
-// codegen.c
+// codegen_g2.c
 //
 
 void codegen(Obj *prog, FILE *out);
@@ -452,6 +419,5 @@ void hashmap_test(void);
 bool file_exists(char *path);
 
 extern StringArray include_paths;
-extern bool opt_fpic;
 extern bool opt_fcommon;
 extern char *base_file;

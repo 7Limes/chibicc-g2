@@ -260,64 +260,6 @@ static Token *read_string_literal(char *start, char *quote) {
   return tok;
 }
 
-// Read a UTF-8-encoded string literal and transcode it in UTF-16.
-//
-// UTF-16 is yet another variable-width encoding for Unicode. Code
-// points smaller than U+10000 are encoded in 2 bytes. Code points
-// equal to or larger than that are encoded in 4 bytes. Each 2 bytes
-// in the 4 byte sequence is called "surrogate", and a 4 byte sequence
-// is called a "surrogate pair".
-static Token *read_utf16_string_literal(char *start, char *quote) {
-  char *end = string_literal_end(quote + 1);
-  uint16_t *buf = calloc(2, end - start);
-  int len = 0;
-
-  for (char *p = quote + 1; p < end;) {
-    if (*p == '\\') {
-      buf[len++] = read_escaped_char(&p, p + 1);
-      continue;
-    }
-
-    uint32_t c = decode_utf8(&p, p);
-    if (c < 0x10000) {
-      // Encode a code point in 2 bytes.
-      buf[len++] = c;
-    } else {
-      // Encode a code point in 4 bytes.
-      c -= 0x10000;
-      buf[len++] = 0xd800 + ((c >> 10) & 0x3ff);
-      buf[len++] = 0xdc00 + (c & 0x3ff);
-    }
-  }
-
-  Token *tok = new_token(TK_STR, start, end + 1);
-  tok->ty = array_of(ty_ushort, len + 1);
-  tok->str = (char *)buf;
-  return tok;
-}
-
-// Read a UTF-8-encoded string literal and transcode it in UTF-32.
-//
-// UTF-32 is a fixed-width encoding for Unicode. Each code point is
-// encoded in 4 bytes.
-static Token *read_utf32_string_literal(char *start, char *quote, Type *ty) {
-  char *end = string_literal_end(quote + 1);
-  uint32_t *buf = calloc(4, end - quote);
-  int len = 0;
-
-  for (char *p = quote + 1; p < end;) {
-    if (*p == '\\')
-      buf[len++] = read_escaped_char(&p, p + 1);
-    else
-      buf[len++] = decode_utf8(&p, p);
-  }
-
-  Token *tok = new_token(TK_STR, start, end + 1);
-  tok->ty = array_of(ty, len + 1);
-  tok->str = (char *)buf;
-  return tok;
-}
-
 static Token *read_char_literal(char *start, char *quote, Type *ty) {
   char *p = quote + 1;
   if (*p == '\0')
@@ -332,6 +274,8 @@ static Token *read_char_literal(char *start, char *quote, Type *ty) {
   char *end = strchr(p, '\'');
   if (!end)
     error_at(p, "unclosed char literal");
+  if (end != p)
+    error_at(start, "multi-character constants are not supported on g2");
 
   Token *tok = new_token(TK_NUM, start, end + 1);
   tok->val = c;
@@ -354,66 +298,34 @@ static bool convert_pp_int(Token *tok) {
     base = 8;
   }
 
-  int64_t val = strtoul(p, &p, base);
+  errno = 0;
+  uint64_t val = strtoul(p, &p, base);
+  bool overflow = (errno == ERANGE);
 
-  // Read U, L or LL suffixes.
-  bool l = false;
-  bool u = false;
-
-  if (startswith(p, "LLU") || startswith(p, "LLu") ||
-      startswith(p, "llU") || startswith(p, "llu") ||
-      startswith(p, "ULL") || startswith(p, "Ull") ||
-      startswith(p, "uLL") || startswith(p, "ull")) {
-    p += 3;
-    l = u = true;
-  } else if (!strncasecmp(p, "lu", 2) || !strncasecmp(p, "ul", 2)) {
+  // Read L or LL suffixes. They are accepted for compatibility but have
+  // no effect, since long is 32 bits on g2.
+  if (startswith(p, "LL") || startswith(p, "ll"))
     p += 2;
-    l = u = true;
-  } else if (startswith(p, "LL") || startswith(p, "ll")) {
-    p += 2;
-    l = true;
-  } else if (*p == 'L' || *p == 'l') {
+  else if (*p == 'L' || *p == 'l')
     p++;
-    l = true;
-  } else if (*p == 'U' || *p == 'u') {
-    p++;
-    u = true;
-  }
 
-  if (p != tok->loc + tok->len)
+  if (p != tok->loc + tok->len) {
+    if (*p == 'U' || *p == 'u' || ((*p == 'L' || *p == 'l') && (p[1] == 'U' || p[1] == 'u')))
+      error_tok(tok, "unsigned integer constants are not supported on g2");
     return false;
-
-  // Infer a type.
-  Type *ty;
-  if (base == 10) {
-    if (l && u)
-      ty = ty_ulong;
-    else if (l)
-      ty = ty_long;
-    else if (u)
-      ty = (val >> 32) ? ty_ulong : ty_uint;
-    else
-      ty = (val >> 31) ? ty_long : ty_int;
-  } else {
-    if (l && u)
-      ty = ty_ulong;
-    else if (l)
-      ty = (val >> 63) ? ty_ulong : ty_long;
-    else if (u)
-      ty = (val >> 32) ? ty_ulong : ty_uint;
-    else if (val >> 63)
-      ty = ty_ulong;
-    else if (val >> 32)
-      ty = ty_long;
-    else if (val >> 31)
-      ty = ty_uint;
-    else
-      ty = ty_int;
   }
+
+  // Every integer constant is a 32-bit signed int. Values in
+  // [2^31, 2^32) are accepted (they are common in hex, e.g. 0xFFFFFFFF)
+  // and wrap to negative numbers.
+  if (overflow || val > 0xFFFFFFFF)
+    error_tok(tok, "integer constant does not fit in 32 bits");
+  if (val > 0x7FFFFFFF)
+    warn_tok(tok, "integer constant wraps to %d", (int32_t)(uint32_t)val);
 
   tok->kind = TK_NUM;
-  tok->val = val;
-  tok->ty = ty;
+  tok->val = (int32_t)(uint32_t)val;
+  tok->ty = ty_int;
   return true;
 }
 
@@ -431,25 +343,10 @@ static void convert_pp_number(Token *tok) {
 
   // If it's not an integer, it must be a floating point constant.
   char *end;
-  long double val = strtold(tok->loc, &end);
-
-  Type *ty;
-  if (*end == 'f' || *end == 'F') {
-    ty = ty_float;
-    end++;
-  } else if (*end == 'l' || *end == 'L') {
-    ty = ty_ldouble;
-    end++;
-  } else {
-    ty = ty_double;
-  }
-
+  strtold(tok->loc, &end);
   if (tok->loc + tok->len != end)
     error_tok(tok, "invalid numeric constant");
-
-  tok->kind = TK_NUM;
-  tok->fval = val;
-  tok->ty = ty;
+  error_tok(tok, "floating-point constants are not supported on g2");
 }
 
 void convert_pp_tokens(Token *tok) {
@@ -474,16 +371,6 @@ static void add_line_numbers(Token *tok) {
     if (*p == '\n')
       n++;
   } while (*p++);
-}
-
-Token *tokenize_string_literal(Token *tok, Type *basety) {
-  Token *t;
-  if (basety->size == 2)
-    t = read_utf16_string_literal(tok->loc, tok->loc);
-  else
-    t = read_utf32_string_literal(tok->loc, tok->loc, basety);
-  t->next = tok->next;
-  return t;
 }
 
 // Tokenize a given string and returns new tokens.
@@ -561,53 +448,14 @@ Token *tokenize(File *file) {
       continue;
     }
 
-    // UTF-16 string literal
-    if (startswith(p, "u\"")) {
-      cur = cur->next = read_utf16_string_literal(p, p + 1);
-      p += cur->len;
-      continue;
-    }
+    // Wide and UTF-16/32 string or character literals
+    if (startswith(p, "u\"") || startswith(p, "L\"") || startswith(p, "U\"") ||
+        startswith(p, "u'") || startswith(p, "L'") || startswith(p, "U'"))
+      error_at(p, "wide string and character literals are not supported on g2");
 
-    // Wide string literal
-    if (startswith(p, "L\"")) {
-      cur = cur->next = read_utf32_string_literal(p, p + 1, ty_int);
-      p += cur->len;
-      continue;
-    }
-
-    // UTF-32 string literal
-    if (startswith(p, "U\"")) {
-      cur = cur->next = read_utf32_string_literal(p, p + 1, ty_uint);
-      p += cur->len;
-      continue;
-    }
-
-    // Character literal
+    // Character literal. Its value is the character's code point.
     if (*p == '\'') {
       cur = cur->next = read_char_literal(p, p, ty_int);
-      cur->val = (char)cur->val;
-      p += cur->len;
-      continue;
-    }
-
-    // UTF-16 character literal
-    if (startswith(p, "u'")) {
-      cur = cur->next = read_char_literal(p, p + 1, ty_ushort);
-      cur->val &= 0xffff;
-      p += cur->len;
-      continue;
-    }
-
-    // Wide character literal
-    if (startswith(p, "L'")) {
-      cur = cur->next = read_char_literal(p, p + 1, ty_int);
-      p += cur->len;
-      continue;
-    }
-
-    // UTF-32 character literal
-    if (startswith(p, "U'")) {
-      cur = cur->next = read_char_literal(p, p + 1, ty_uint);
       p += cur->len;
       continue;
     }

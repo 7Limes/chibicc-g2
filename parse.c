@@ -44,7 +44,6 @@ typedef struct {
   bool is_static;
   bool is_extern;
   bool is_inline;
-  bool is_tls;
   int align;
 } VarAttr;
 
@@ -92,6 +91,9 @@ static Scope *scope = &(Scope){};
 // Points to the function object the parser is currently parsing.
 static Obj *current_fn;
 
+// The string literal for __func__ in the current function, if used.
+static Obj *current_fn_name;
+
 // Lists of all goto statements and labels in the curent function.
 static Node *gotos;
 static Node *labels;
@@ -104,7 +106,6 @@ static char *cont_label;
 // a switch statement. Otherwise, NULL.
 static Node *current_switch;
 
-static Obj *builtin_alloca;
 
 static bool is_typename(Token *tok);
 static Type *declspec(Token **rest, Token *tok, VarAttr *attr);
@@ -130,7 +131,6 @@ static int64_t eval_rval(Node *node, char ***label);
 static bool is_const_expr(Node *node);
 static Node *assign(Token **rest, Token *tok);
 static Node *logor(Token **rest, Token *tok);
-static double eval_double(Node *node);
 static Node *conditional(Token **rest, Token *tok);
 static Node *logand(Token **rest, Token *tok);
 static Node *bitor(Token **rest, Token *tok);
@@ -235,12 +235,6 @@ static Node *new_var_node(Obj *var, Token *tok) {
   return node;
 }
 
-static Node *new_vla_ptr(Obj *var, Token *tok) {
-  Node *node = new_node(ND_VLA_PTR, tok);
-  node->var = var;
-  return node;
-}
-
 Node *new_cast(Node *expr, Type *ty) {
   add_type(expr);
 
@@ -335,7 +329,9 @@ static Obj *new_anon_gvar(Type *ty) {
 
 static Obj *new_string_literal(char *p, Type *ty) {
   Obj *var = new_anon_gvar(ty);
-  var->init_data = p;
+  var->init_data = calloc(ty->array_len, sizeof(int32_t));
+  for (int i = 0; i < ty->array_len; i++)
+    var->init_data[i] = (unsigned char)p[i];
   return var;
 }
 
@@ -390,21 +386,20 @@ static Type *declspec(Token **rest, Token *tok, VarAttr *attr) {
     SHORT    = 1 << 6,
     INT      = 1 << 8,
     LONG     = 1 << 10,
-    FLOAT    = 1 << 12,
-    DOUBLE   = 1 << 14,
     OTHER    = 1 << 16,
     SIGNED   = 1 << 17,
-    UNSIGNED = 1 << 18,
   };
 
   Type *ty = ty_int;
   int counter = 0;
-  bool is_atomic = false;
 
   while (is_typename(tok)) {
     // Handle storage class specifiers.
+    if (equal(tok, "_Thread_local") || equal(tok, "__thread"))
+      error_tok(tok, "thread-local storage is not supported on g2");
+
     if (equal(tok, "typedef") || equal(tok, "static") || equal(tok, "extern") ||
-        equal(tok, "inline") || equal(tok, "_Thread_local") || equal(tok, "__thread")) {
+        equal(tok, "inline")) {
       if (!attr)
         error_tok(tok, "storage class specifier is not allowed in this context");
 
@@ -414,15 +409,13 @@ static Type *declspec(Token **rest, Token *tok, VarAttr *attr) {
         attr->is_static = true;
       else if (equal(tok, "extern"))
         attr->is_extern = true;
-      else if (equal(tok, "inline"))
-        attr->is_inline = true;
       else
-        attr->is_tls = true;
+        attr->is_inline = true;
 
       if (attr->is_typedef &&
-          attr->is_static + attr->is_extern + attr->is_inline + attr->is_tls > 1)
+          attr->is_static + attr->is_extern + attr->is_inline > 1)
         error_tok(tok, "typedef may not be used together with static,"
-                  " extern, inline, __thread or _Thread_local");
+                  " extern or inline");
       tok = tok->next;
       continue;
     }
@@ -434,15 +427,8 @@ static Type *declspec(Token **rest, Token *tok, VarAttr *attr) {
         consume(&tok, tok, "__restrict__") || consume(&tok, tok, "_Noreturn"))
       continue;
 
-    if (equal(tok, "_Atomic")) {
-      tok = tok->next;
-      if (equal(tok , "(")) {
-        ty = typename(&tok, tok->next);
-        tok = skip(tok, ")");
-      }
-      is_atomic = true;
-      continue;
-    }
+    if (equal(tok, "_Atomic"))
+      error_tok(tok, "atomic types are not supported on g2");
 
     if (equal(tok, "_Alignas")) {
       if (!attr)
@@ -494,14 +480,12 @@ static Type *declspec(Token **rest, Token *tok, VarAttr *attr) {
       counter += INT;
     else if (equal(tok, "long"))
       counter += LONG;
-    else if (equal(tok, "float"))
-      counter += FLOAT;
-    else if (equal(tok, "double"))
-      counter += DOUBLE;
+    else if (equal(tok, "float") || equal(tok, "double"))
+      error_tok(tok, "floating point is not supported on g2");
     else if (equal(tok, "signed"))
       counter |= SIGNED;
     else if (equal(tok, "unsigned"))
-      counter |= UNSIGNED;
+      error_tok(tok, "unsigned types are not supported on g2");
     else
       unreachable();
 
@@ -516,27 +500,16 @@ static Type *declspec(Token **rest, Token *tok, VarAttr *attr) {
     case SIGNED + CHAR:
       ty = ty_char;
       break;
-    case UNSIGNED + CHAR:
-      ty = ty_uchar;
-      break;
     case SHORT:
     case SHORT + INT:
     case SIGNED + SHORT:
     case SIGNED + SHORT + INT:
       ty = ty_short;
       break;
-    case UNSIGNED + SHORT:
-    case UNSIGNED + SHORT + INT:
-      ty = ty_ushort;
-      break;
     case INT:
     case SIGNED:
     case SIGNED + INT:
       ty = ty_int;
-      break;
-    case UNSIGNED:
-    case UNSIGNED + INT:
-      ty = ty_uint;
       break;
     case LONG:
     case LONG + INT:
@@ -548,21 +521,6 @@ static Type *declspec(Token **rest, Token *tok, VarAttr *attr) {
     case SIGNED + LONG + LONG + INT:
       ty = ty_long;
       break;
-    case UNSIGNED + LONG:
-    case UNSIGNED + LONG + INT:
-    case UNSIGNED + LONG + LONG:
-    case UNSIGNED + LONG + LONG + INT:
-      ty = ty_ulong;
-      break;
-    case FLOAT:
-      ty = ty_float;
-      break;
-    case DOUBLE:
-      ty = ty_double;
-      break;
-    case LONG + DOUBLE:
-      ty = ty_ldouble;
-      break;
     default:
       error_tok(tok, "invalid type");
     }
@@ -570,16 +528,11 @@ static Type *declspec(Token **rest, Token *tok, VarAttr *attr) {
     tok = tok->next;
   }
 
-  if (is_atomic) {
-    ty = copy_type(ty);
-    ty->is_atomic = true;
-  }
-
   *rest = tok;
   return ty;
 }
 
-// func-params = ("void" | param ("," param)* ("," "...")?)? ")"
+// func-params = ("void" | param ("," param)*)? ")"
 // param       = declspec declarator
 static Type *func_params(Token **rest, Token *tok, Type *ty) {
   if (equal(tok, "void") && equal(tok->next, ")")) {
@@ -589,18 +542,13 @@ static Type *func_params(Token **rest, Token *tok, Type *ty) {
 
   Type head = {};
   Type *cur = &head;
-  bool is_variadic = false;
 
   while (!equal(tok, ")")) {
     if (cur != &head)
       tok = skip(tok, ",");
 
-    if (equal(tok, "...")) {
-      is_variadic = true;
-      tok = tok->next;
-      skip(tok, ")");
-      break;
-    }
+    if (equal(tok, "..."))
+      error_tok(tok, "variadic functions are not supported on g2");
 
     Type *ty2 = declspec(&tok, tok, NULL);
     ty2 = declarator(&tok, tok, ty2);
@@ -622,12 +570,10 @@ static Type *func_params(Token **rest, Token *tok, Type *ty) {
     cur = cur->next = copy_type(ty2);
   }
 
-  if (cur == &head)
-    is_variadic = true;
-
+  // An empty parameter list "()" means "no parameters", as in C23,
+  // not an unspecified (variadic) parameter list.
   ty = func_type(ty);
   ty->params = head.next;
-  ty->is_variadic = is_variadic;
   *rest = tok->next;
   return ty;
 }
@@ -646,8 +592,8 @@ static Type *array_dimensions(Token **rest, Token *tok, Type *ty) {
   tok = skip(tok, "]");
   ty = type_suffix(rest, tok, ty);
 
-  if (ty->kind == TY_VLA || !is_const_expr(expr))
-    return vla_of(ty, expr);
+  if (!is_const_expr(expr))
+    error_tok(expr->tok, "variable-length arrays are not supported on g2");
   return array_of(ty, eval(expr));
 }
 
@@ -809,37 +755,6 @@ static Type *typeof_specifier(Token **rest, Token *tok) {
   return ty;
 }
 
-// Generate code for computing a VLA size.
-static Node *compute_vla_size(Type *ty, Token *tok) {
-  Node *node = new_node(ND_NULL_EXPR, tok);
-  if (ty->base)
-    node = new_binary(ND_COMMA, node, compute_vla_size(ty->base, tok), tok);
-
-  if (ty->kind != TY_VLA)
-    return node;
-
-  Node *base_sz;
-  if (ty->base->kind == TY_VLA)
-    base_sz = new_var_node(ty->base->vla_size, tok);
-  else
-    base_sz = new_num(ty->base->size, tok);
-
-  ty->vla_size = new_lvar("", ty_ulong);
-  Node *expr = new_binary(ND_ASSIGN, new_var_node(ty->vla_size, tok),
-                          new_binary(ND_MUL, ty->vla_len, base_sz, tok),
-                          tok);
-  return new_binary(ND_COMMA, node, expr, tok);
-}
-
-static Node *new_alloca(Node *sz) {
-  Node *node = new_unary(ND_FUNCALL, new_var_node(builtin_alloca, sz->tok), sz->tok);
-  node->func_ty = builtin_alloca->ty;
-  node->ty = builtin_alloca->ty->return_ty;
-  node->args = sz;
-  add_type(sz);
-  return node;
-}
-
 // declaration = declspec (declarator ("=" expr)? ("," declarator ("=" expr)?)*)? ";"
 static Node *declaration(Token **rest, Token *tok, Type *basety, VarAttr *attr) {
   Node head = {};
@@ -862,28 +777,6 @@ static Node *declaration(Token **rest, Token *tok, Type *basety, VarAttr *attr) 
       push_scope(get_ident(ty->name))->var = var;
       if (equal(tok, "="))
         gvar_initializer(&tok, tok->next, var);
-      continue;
-    }
-
-    // Generate code for computing a VLA size. We need to do this
-    // even if ty is not VLA because ty may be a pointer to VLA
-    // (e.g. int (*foo)[n][m] where n and m are variables.)
-    cur = cur->next = new_unary(ND_EXPR_STMT, compute_vla_size(ty, tok), tok);
-
-    if (ty->kind == TY_VLA) {
-      if (equal(tok, "="))
-        error_tok(tok, "variable-sized object may not be initialized");
-
-      // Variable length arrays (VLAs) are translated to alloca() calls.
-      // For example, `int x[n+2]` is translated to `tmp = n + 2,
-      // x = alloca(tmp)`.
-      Obj *var = new_lvar(get_ident(ty->name), ty);
-      Token *tok = ty->name;
-      Node *expr = new_binary(ND_ASSIGN, new_vla_ptr(var, tok),
-                              new_alloca(new_var_node(ty->vla_size, tok)),
-                              tok);
-
-      cur = cur->next = new_unary(ND_EXPR_STMT, expr, tok);
       continue;
     }
 
@@ -925,28 +818,10 @@ static void string_initializer(Token **rest, Token *tok, Initializer *init) {
 
   int len = MIN(init->ty->array_len, tok->ty->array_len);
 
-  switch (init->ty->base->size) {
-  case 1: {
-    char *str = tok->str;
-    for (int i = 0; i < len; i++)
-      init->children[i]->expr = new_num(str[i], tok);
-    break;
-  }
-  case 2: {
-    uint16_t *str = (uint16_t *)tok->str;
-    for (int i = 0; i < len; i++)
-      init->children[i]->expr = new_num(str[i], tok);
-    break;
-  }
-  case 4: {
-    uint32_t *str = (uint32_t *)tok->str;
-    for (int i = 0; i < len; i++)
-      init->children[i]->expr = new_num(str[i], tok);
-    break;
-  }
-  default:
-    unreachable();
-  }
+  // Each byte of the (UTF-8) string literal becomes one slot.
+  unsigned char *str = (unsigned char *)tok->str;
+  for (int i = 0; i < len; i++)
+    init->children[i]->expr = new_num(str[i], tok);
 
   *rest = tok->next;
 }
@@ -1388,33 +1263,10 @@ static Node *lvar_initializer(Token **rest, Token *tok, Obj *var) {
   return new_binary(ND_COMMA, lhs, rhs, tok);
 }
 
-static uint64_t read_buf(char *buf, int sz) {
-  if (sz == 1)
-    return *buf;
-  if (sz == 2)
-    return *(uint16_t *)buf;
-  if (sz == 4)
-    return *(uint32_t *)buf;
-  if (sz == 8)
-    return *(uint64_t *)buf;
-  unreachable();
-}
-
-static void write_buf(char *buf, uint64_t val, int sz) {
-  if (sz == 1)
-    *buf = val;
-  else if (sz == 2)
-    *(uint16_t *)buf = val;
-  else if (sz == 4)
-    *(uint32_t *)buf = val;
-  else if (sz == 8)
-    *(uint64_t *)buf = val;
-  else
-    unreachable();
-}
-
+// Writes the initial value of a global variable into `buf`, which holds
+// one int32_t per memory slot.
 static Relocation *
-write_gvar_data(Relocation *cur, Initializer *init, Type *ty, char *buf, int offset) {
+write_gvar_data(Relocation *cur, Initializer *init, Type *ty, int32_t *buf, int offset) {
   if (ty->kind == TY_ARRAY) {
     int sz = ty->base->size;
     for (int i = 0; i < ty->array_len; i++)
@@ -1423,23 +1275,9 @@ write_gvar_data(Relocation *cur, Initializer *init, Type *ty, char *buf, int off
   }
 
   if (ty->kind == TY_STRUCT) {
-    for (Member *mem = ty->members; mem; mem = mem->next) {
-      if (mem->is_bitfield) {
-        Node *expr = init->children[mem->idx]->expr;
-        if (!expr)
-          break;
-
-        char *loc = buf + offset + mem->offset;
-        uint64_t oldval = read_buf(loc, mem->ty->size);
-        uint64_t newval = eval(expr);
-        uint64_t mask = (1L << mem->bit_width) - 1;
-        uint64_t combined = oldval | ((newval & mask) << mem->bit_offset);
-        write_buf(loc, combined, mem->ty->size);
-      } else {
-        cur = write_gvar_data(cur, init->children[mem->idx], mem->ty, buf,
-                              offset + mem->offset);
-      }
-    }
+    for (Member *mem = ty->members; mem; mem = mem->next)
+      cur = write_gvar_data(cur, init->children[mem->idx], mem->ty, buf,
+                            offset + mem->offset);
     return cur;
   }
 
@@ -1453,21 +1291,11 @@ write_gvar_data(Relocation *cur, Initializer *init, Type *ty, char *buf, int off
   if (!init->expr)
     return cur;
 
-  if (ty->kind == TY_FLOAT) {
-    *(float *)(buf + offset) = eval_double(init->expr);
-    return cur;
-  }
-
-  if (ty->kind == TY_DOUBLE) {
-    *(double *)(buf + offset) = eval_double(init->expr);
-    return cur;
-  }
-
   char **label = NULL;
-  uint64_t val = eval2(init->expr, &label);
+  int64_t val = eval2(init->expr, &label);
 
   if (!label) {
-    write_buf(buf + offset, val, ty->size);
+    buf[offset] = val;
     return cur;
   }
 
@@ -1487,7 +1315,7 @@ static void gvar_initializer(Token **rest, Token *tok, Obj *var) {
   Initializer *init = initializer(rest, tok, var->ty, &var->ty);
 
   Relocation head = {};
-  char *buf = calloc(1, var->ty->size);
+  int32_t *buf = calloc(var->ty->size, sizeof(int32_t));
   write_gvar_data(&head, init, var->ty, buf, 0);
   var->init_data = buf;
   var->rel = head.next;
@@ -1513,22 +1341,6 @@ static bool is_typename(Token *tok) {
   return hashmap_get2(&map, tok->loc, tok->len) || find_typedef(tok);
 }
 
-// asm-stmt = "asm" ("volatile" | "inline")* "(" string-literal ")"
-static Node *asm_stmt(Token **rest, Token *tok) {
-  Node *node = new_node(ND_ASM, tok);
-  tok = tok->next;
-
-  while (equal(tok, "volatile") || equal(tok, "inline"))
-    tok = tok->next;
-
-  tok = skip(tok, "(");
-  if (tok->kind != TK_STR || tok->ty->base->kind != TY_CHAR)
-    error_tok(tok, "expected string literal");
-  node->asm_str = tok->str;
-  *rest = skip(tok->next, ")");
-  return node;
-}
-
 // stmt = "return" expr? ";"
 //      | "if" "(" expr ")" stmt ("else" stmt)?
 //      | "switch" "(" expr ")" stmt
@@ -1537,8 +1349,7 @@ static Node *asm_stmt(Token **rest, Token *tok) {
 //      | "for" "(" expr-stmt expr? ";" expr? ")" stmt
 //      | "while" "(" expr ")" stmt
 //      | "do" stmt "while" "(" expr ")" ";"
-//      | "asm" asm-stmt
-//      | "goto" (ident | "*" expr) ";"
+//      | "goto" ident ";"
 //      | "break" ";"
 //      | "continue" ";"
 //      | ident ":" stmt
@@ -1706,16 +1517,11 @@ static Node *stmt(Token **rest, Token *tok) {
   }
 
   if (equal(tok, "asm"))
-    return asm_stmt(rest, tok);
+    error_tok(tok, "inline assembly is not supported on g2");
 
   if (equal(tok, "goto")) {
-    if (equal(tok->next, "*")) {
-      // [GNU] `goto *ptr` jumps to the address specified by `ptr`.
-      Node *node = new_node(ND_GOTO_EXPR, tok);
-      node->lhs = expr(&tok, tok->next->next);
-      *rest = skip(tok, ";");
-      return node;
-    }
+    if (equal(tok->next, "*"))
+      error_tok(tok, "computed goto is not supported on g2");
 
     Node *node = new_node(ND_GOTO, tok);
     node->label = get_ident(tok->next);
@@ -1829,58 +1635,87 @@ static int64_t eval(Node *node) {
   return eval2(node, NULL);
 }
 
+// Wraps a value to a 32-bit signed integer, as g2 arithmetic does.
+static int64_t wrap32(int64_t val) {
+  return (int32_t)(uint32_t)val;
+}
+
+// g2's div rounds toward negative infinity (unlike C, which truncates
+// toward zero). Constant folding must give the same result as the VM.
+static int64_t floor_div(Node *node, int64_t a, int64_t b) {
+  if (b == 0)
+    error_tok(node->tok, "division by zero in constant expression");
+  int64_t q = a / b;
+  if (a % b != 0 && (a < 0) != (b < 0))
+    q--;
+  return wrap32(q);
+}
+
+// g2's mod takes the sign of the divisor, so that
+// a == floor_div(a, b) * b + floor_mod(a, b).
+static int64_t floor_mod(Node *node, int64_t a, int64_t b) {
+  if (b == 0)
+    error_tok(node->tok, "division by zero in constant expression");
+  int64_t r = a % b;
+  if (r != 0 && (r < 0) != (b < 0))
+    r += b;
+  return r;
+}
+
+static int64_t shift_count(Node *node) {
+  int64_t n = eval(node->rhs);
+  if (n < 0 || n > 31)
+    error_tok(node->rhs->tok, "shift count out of range (0..31): %ld", n);
+  return n;
+}
+
 // Evaluate a given node as a constant expression.
 //
 // A constant expression is either just a number or ptr+n where ptr
 // is a pointer to a global variable and n is a postiive/negative
 // number. The latter form is accepted only as an initialization
 // expression for a global variable.
+//
+// All arithmetic follows g2 semantics: values are 32-bit signed
+// integers that wrap around, and / and % round toward negative infinity.
 static int64_t eval2(Node *node, char ***label) {
   add_type(node);
 
-  if (is_flonum(node->ty))
-    return eval_double(node);
-
   switch (node->kind) {
   case ND_ADD:
-    return eval2(node->lhs, label) + eval(node->rhs);
+    return wrap32((uint64_t)eval2(node->lhs, label) + (uint64_t)eval(node->rhs));
   case ND_SUB:
-    return eval2(node->lhs, label) - eval(node->rhs);
+    return wrap32((uint64_t)eval2(node->lhs, label) - (uint64_t)eval(node->rhs));
   case ND_MUL:
-    return eval(node->lhs) * eval(node->rhs);
+    return wrap32((uint64_t)eval(node->lhs) * (uint64_t)eval(node->rhs));
   case ND_DIV:
-    if (node->ty->is_unsigned)
-      return (uint64_t)eval(node->lhs) / eval(node->rhs);
-    return eval(node->lhs) / eval(node->rhs);
+    return floor_div(node, eval(node->lhs), eval(node->rhs));
   case ND_NEG:
-    return -eval(node->lhs);
+    return wrap32(-(uint64_t)eval(node->lhs));
   case ND_MOD:
-    if (node->ty->is_unsigned)
-      return (uint64_t)eval(node->lhs) % eval(node->rhs);
-    return eval(node->lhs) % eval(node->rhs);
+    return floor_mod(node, eval(node->lhs), eval(node->rhs));
   case ND_BITAND:
     return eval(node->lhs) & eval(node->rhs);
   case ND_BITOR:
     return eval(node->lhs) | eval(node->rhs);
   case ND_BITXOR:
     return eval(node->lhs) ^ eval(node->rhs);
-  case ND_SHL:
-    return eval(node->lhs) << eval(node->rhs);
-  case ND_SHR:
-    if (node->ty->is_unsigned && node->ty->size == 8)
-      return (uint64_t)eval(node->lhs) >> eval(node->rhs);
-    return eval(node->lhs) >> eval(node->rhs);
+  case ND_SHL: {
+    int64_t n = shift_count(node);
+    return wrap32((uint64_t)eval(node->lhs) << n);
+  }
+  case ND_SHR: {
+    // Arithmetic shift. The operand is a sign-extended 32-bit value.
+    int64_t n = shift_count(node);
+    return eval(node->lhs) >> n;
+  }
   case ND_EQ:
     return eval(node->lhs) == eval(node->rhs);
   case ND_NE:
     return eval(node->lhs) != eval(node->rhs);
   case ND_LT:
-    if (node->lhs->ty->is_unsigned)
-      return (uint64_t)eval(node->lhs) < eval(node->rhs);
     return eval(node->lhs) < eval(node->rhs);
   case ND_LE:
-    if (node->lhs->ty->is_unsigned)
-      return (uint64_t)eval(node->lhs) <= eval(node->rhs);
     return eval(node->lhs) <= eval(node->rhs);
   case ND_COND:
     return eval(node->cond) ? eval2(node->then, label) : eval2(node->els, label);
@@ -1889,27 +1724,19 @@ static int64_t eval2(Node *node, char ***label) {
   case ND_NOT:
     return !eval(node->lhs);
   case ND_BITNOT:
-    return ~eval(node->lhs);
+    return wrap32(~eval(node->lhs));
   case ND_LOGAND:
     return eval(node->lhs) && eval(node->rhs);
   case ND_LOGOR:
     return eval(node->lhs) || eval(node->rhs);
   case ND_CAST: {
     int64_t val = eval2(node->lhs, label);
-    if (is_integer(node->ty)) {
-      switch (node->ty->size) {
-      case 1: return node->ty->is_unsigned ? (uint8_t)val : (int8_t)val;
-      case 2: return node->ty->is_unsigned ? (uint16_t)val : (int16_t)val;
-      case 4: return node->ty->is_unsigned ? (uint32_t)val : (int32_t)val;
-      }
-    }
-    return val;
+    if (node->ty->kind == TY_BOOL && (!label || !*label))
+      return val != 0;
+    return wrap32(val);
   }
   case ND_ADDR:
     return eval_rval(node->lhs, label);
-  case ND_LABEL_VAL:
-    *label = &node->unique_label;
-    return 0;
   case ND_MEMBER:
     if (!label)
       error_tok(node->tok, "not a compile-time constant");
@@ -1924,7 +1751,7 @@ static int64_t eval2(Node *node, char ***label) {
     *label = &node->var->name;
     return 0;
   case ND_NUM:
-    return node->val;
+    return wrap32(node->val);
   }
 
   error_tok(node->tok, "not a compile-time constant");
@@ -1989,41 +1816,6 @@ int64_t const_expr(Token **rest, Token *tok) {
   return eval(node);
 }
 
-static double eval_double(Node *node) {
-  add_type(node);
-
-  if (is_integer(node->ty)) {
-    if (node->ty->is_unsigned)
-      return (unsigned long)eval(node);
-    return eval(node);
-  }
-
-  switch (node->kind) {
-  case ND_ADD:
-    return eval_double(node->lhs) + eval_double(node->rhs);
-  case ND_SUB:
-    return eval_double(node->lhs) - eval_double(node->rhs);
-  case ND_MUL:
-    return eval_double(node->lhs) * eval_double(node->rhs);
-  case ND_DIV:
-    return eval_double(node->lhs) / eval_double(node->rhs);
-  case ND_NEG:
-    return -eval_double(node->lhs);
-  case ND_COND:
-    return eval_double(node->cond) ? eval_double(node->then) : eval_double(node->els);
-  case ND_COMMA:
-    return eval_double(node->rhs);
-  case ND_CAST:
-    if (is_flonum(node->lhs->ty))
-      return eval_double(node->lhs);
-    return eval(node->lhs);
-  case ND_NUM:
-    return node->fval;
-  }
-
-  error_tok(node->tok, "not a compile-time constant");
-}
-
 // Convert op= operators to expressions containing an assignment.
 //
 // In general, `A op= C` is converted to ``tmp = &A, *tmp = *tmp op B`.
@@ -2057,68 +1849,6 @@ static Node *to_assign(Node *binary) {
                              tok);
 
     return new_binary(ND_COMMA, expr1, expr4, tok);
-  }
-
-  // If A is an atomic type, Convert `A op= B` to
-  //
-  // ({
-  //   T1 *addr = &A; T2 val = (B); T1 old = *addr; T1 new;
-  //   do {
-  //    new = old op val;
-  //   } while (!atomic_compare_exchange_strong(addr, &old, new));
-  //   new;
-  // })
-  if (binary->lhs->ty->is_atomic) {
-    Node head = {};
-    Node *cur = &head;
-
-    Obj *addr = new_lvar("", pointer_to(binary->lhs->ty));
-    Obj *val = new_lvar("", binary->rhs->ty);
-    Obj *old = new_lvar("", binary->lhs->ty);
-    Obj *new = new_lvar("", binary->lhs->ty);
-
-    cur = cur->next =
-      new_unary(ND_EXPR_STMT,
-                new_binary(ND_ASSIGN, new_var_node(addr, tok),
-                           new_unary(ND_ADDR, binary->lhs, tok), tok),
-                tok);
-
-    cur = cur->next =
-      new_unary(ND_EXPR_STMT,
-                new_binary(ND_ASSIGN, new_var_node(val, tok), binary->rhs, tok),
-                tok);
-
-    cur = cur->next =
-      new_unary(ND_EXPR_STMT,
-                new_binary(ND_ASSIGN, new_var_node(old, tok),
-                           new_unary(ND_DEREF, new_var_node(addr, tok), tok), tok),
-                tok);
-
-    Node *loop = new_node(ND_DO, tok);
-    loop->brk_label = new_unique_name();
-    loop->cont_label = new_unique_name();
-
-    Node *body = new_binary(ND_ASSIGN,
-                            new_var_node(new, tok),
-                            new_binary(binary->kind, new_var_node(old, tok),
-                                       new_var_node(val, tok), tok),
-                            tok);
-
-    loop->then = new_node(ND_BLOCK, tok);
-    loop->then->body = new_unary(ND_EXPR_STMT, body, tok);
-
-    Node *cas = new_node(ND_CAS, tok);
-    cas->cas_addr = new_var_node(addr, tok);
-    cas->cas_old = new_unary(ND_ADDR, new_var_node(old, tok), tok);
-    cas->cas_new = new_var_node(new, tok);
-    loop->cond = new_unary(ND_NOT, cas, tok);
-
-    cur = cur->next = loop;
-    cur = cur->next = new_unary(ND_EXPR_STMT, new_var_node(new, tok), tok);
-
-    Node *node = new_node(ND_STMT_EXPR, tok);
-    node->body = head.next;
-    return node;
   }
 
   // Convert `A op= B` to ``tmp = &A, *tmp = *tmp op B`.
@@ -2365,14 +2095,9 @@ static Node *new_add(Node *lhs, Node *rhs, Token *tok) {
     rhs = tmp;
   }
 
-  // VLA + num
-  if (lhs->ty->base->kind == TY_VLA) {
-    rhs = new_binary(ND_MUL, rhs, new_var_node(lhs->ty->base->vla_size, tok), tok);
-    return new_binary(ND_ADD, lhs, rhs, tok);
-  }
-
-  // ptr + num
-  rhs = new_binary(ND_MUL, rhs, new_long(lhs->ty->base->size, tok), tok);
+  // ptr + num. Scalars are one slot, so most pointers need no scaling.
+  if (lhs->ty->base->size != 1)
+    rhs = new_binary(ND_MUL, rhs, new_long(lhs->ty->base->size, tok), tok);
   return new_binary(ND_ADD, lhs, rhs, tok);
 }
 
@@ -2385,18 +2110,10 @@ static Node *new_sub(Node *lhs, Node *rhs, Token *tok) {
   if (is_numeric(lhs->ty) && is_numeric(rhs->ty))
     return new_binary(ND_SUB, lhs, rhs, tok);
 
-  // VLA + num
-  if (lhs->ty->base->kind == TY_VLA) {
-    rhs = new_binary(ND_MUL, rhs, new_var_node(lhs->ty->base->vla_size, tok), tok);
-    add_type(rhs);
-    Node *node = new_binary(ND_SUB, lhs, rhs, tok);
-    node->ty = lhs->ty;
-    return node;
-  }
-
   // ptr - num
   if (lhs->ty->base && is_integer(rhs->ty)) {
-    rhs = new_binary(ND_MUL, rhs, new_long(lhs->ty->base->size, tok), tok);
+    if (lhs->ty->base->size != 1)
+      rhs = new_binary(ND_MUL, rhs, new_long(lhs->ty->base->size, tok), tok);
     add_type(rhs);
     Node *node = new_binary(ND_SUB, lhs, rhs, tok);
     node->ty = lhs->ty;
@@ -2407,6 +2124,8 @@ static Node *new_sub(Node *lhs, Node *rhs, Token *tok) {
   if (lhs->ty->base && rhs->ty->base) {
     Node *node = new_binary(ND_SUB, lhs, rhs, tok);
     node->ty = ty_long;
+    if (lhs->ty->base->size == 1)
+      return node;
     return new_binary(ND_DIV, node, new_num(lhs->ty->base->size, tok), tok);
   }
 
@@ -2528,14 +2247,8 @@ static Node *unary(Token **rest, Token *tok) {
     return to_assign(new_sub(unary(rest, tok->next), new_num(1, tok), tok));
 
   // [GNU] labels-as-values
-  if (equal(tok, "&&")) {
-    Node *node = new_node(ND_LABEL_VAL, tok);
-    node->label = get_ident(tok->next);
-    node->goto_next = gotos;
-    gotos = node;
-    *rest = tok->next->next;
-    return node;
-  }
+  if (equal(tok, "&&"))
+    error_tok(tok, "labels as values are not supported on g2");
 
   return postfix(rest, tok);
 }
@@ -2574,10 +2287,8 @@ static void struct_members(Token **rest, Token *tok, Type *ty) {
       mem->idx = idx++;
       mem->align = attr.align ? attr.align : mem->ty->align;
 
-      if (consume(&tok, tok, ":")) {
-        mem->is_bitfield = true;
-        mem->bit_width = const_expr(&tok, tok);
-      }
+      if (equal(tok, ":"))
+        error_tok(tok, "bit-fields are not supported on g2");
 
       cur = cur->next = mem;
     }
@@ -2892,18 +2603,11 @@ static Node *funcall(Token **rest, Token *tok, Node *fn) {
     Node *arg = assign(&tok, tok);
     add_type(arg);
 
-    if (!param_ty && !ty->is_variadic)
+    if (!param_ty)
       error_tok(tok, "too many arguments");
 
-    if (param_ty) {
-      if (param_ty->kind != TY_STRUCT && param_ty->kind != TY_UNION)
-        arg = new_cast(arg, param_ty);
-      param_ty = param_ty->next;
-    } else if (arg->ty->kind == TY_FLOAT) {
-      // If parameter type is omitted (e.g. in "..."), float
-      // arguments are promoted to double.
-      arg = new_cast(arg, ty_double);
-    }
+    arg = new_cast(arg, param_ty);
+    param_ty = param_ty->next;
 
     cur = cur->next = arg;
   }
@@ -2917,11 +2621,6 @@ static Node *funcall(Token **rest, Token *tok, Node *fn) {
   node->func_ty = ty;
   node->ty = ty->return_ty;
   node->args = head.next;
-
-  // If a function returns a struct, it is caller's responsibility
-  // to allocate a space for the return value.
-  if (node->ty->kind == TY_STRUCT || node->ty->kind == TY_UNION)
-    node->ret_buffer = new_lvar("", node->ty);
   return node;
 }
 
@@ -3001,23 +2700,12 @@ static Node *primary(Token **rest, Token *tok) {
     Type *ty = typename(&tok, tok->next->next);
     *rest = skip(tok, ")");
 
-    if (ty->kind == TY_VLA) {
-      if (ty->vla_size)
-        return new_var_node(ty->vla_size, tok);
-
-      Node *lhs = compute_vla_size(ty, tok);
-      Node *rhs = new_var_node(ty->vla_size, tok);
-      return new_binary(ND_COMMA, lhs, rhs, tok);
-    }
-
     return new_ulong(ty->size, start);
   }
 
   if (equal(tok, "sizeof")) {
     Node *node = unary(rest, tok->next);
     add_type(node);
-    if (node->ty->kind == TY_VLA)
-      return new_var_node(node->ty->vla_size, tok);
     return new_ulong(node->ty->size, tok);
   }
 
@@ -3052,31 +2740,7 @@ static Node *primary(Token **rest, Token *tok) {
 
     if (is_integer(ty) || ty->kind == TY_PTR)
       return new_num(0, start);
-    if (is_flonum(ty))
-      return new_num(1, start);
     return new_num(2, start);
-  }
-
-  if (equal(tok, "__builtin_compare_and_swap")) {
-    Node *node = new_node(ND_CAS, tok);
-    tok = skip(tok->next, "(");
-    node->cas_addr = assign(&tok, tok);
-    tok = skip(tok, ",");
-    node->cas_old = assign(&tok, tok);
-    tok = skip(tok, ",");
-    node->cas_new = assign(&tok, tok);
-    *rest = skip(tok, ")");
-    return node;
-  }
-
-  if (equal(tok, "__builtin_atomic_exchange")) {
-    Node *node = new_node(ND_EXCH, tok);
-    tok = skip(tok->next, "(");
-    node->lhs = assign(&tok, tok);
-    tok = skip(tok, ",");
-    node->rhs = assign(&tok, tok);
-    *rest = skip(tok, ")");
-    return node;
   }
 
   if (tok->kind == TK_IDENT) {
@@ -3099,6 +2763,18 @@ static Node *primary(Token **rest, Token *tok) {
         return new_num(sc->enum_val, tok);
     }
 
+    // [https://www.sigbus.info/n1570#6.4.2.2p1] "__func__" is
+    // automatically defined as a local variable containing the
+    // current function name. [GNU] __FUNCTION__ is another name for it.
+    // The string is only created when it is used, because every
+    // string literal costs memory and initialization code on g2.
+    if (current_fn && (equal(tok, "__func__") || equal(tok, "__FUNCTION__"))) {
+      if (!current_fn_name)
+        current_fn_name = new_string_literal(
+          current_fn->name, array_of(ty_char, strlen(current_fn->name) + 1));
+      return new_var_node(current_fn_name, tok);
+    }
+
     if (equal(tok->next, "("))
       error_tok(tok, "implicit declaration of a function");
     error_tok(tok, "undefined variable");
@@ -3111,14 +2787,7 @@ static Node *primary(Token **rest, Token *tok) {
   }
 
   if (tok->kind == TK_NUM) {
-    Node *node;
-    if (is_flonum(tok->ty)) {
-      node = new_node(ND_NUM, tok);
-      node->fval = tok->fval;
-    } else {
-      node = new_num(tok->val, tok);
-    }
-
+    Node *node = new_num(tok->val, tok);
     node->ty = tok->ty;
     *rest = tok->next;
     return node;
@@ -3220,39 +2889,31 @@ static Token *function(Token *tok, Type *basety, VarAttr *attr) {
     fn->is_inline = attr->is_inline;
   }
 
-  fn->is_root = !(fn->is_static && fn->is_inline);
+  // The entry stub calls start() and tick(), so they are the only roots.
+  // Functions that are not reachable from them are never emitted.
+  fn->is_root = !strcmp(fn->name, "start") || !strcmp(fn->name, "tick");
+
+  // Struct and union values can't be passed to or returned from
+  // functions on g2. Pass a pointer instead.
+  Type *rty = ty->return_ty;
+  if (rty->kind == TY_STRUCT || rty->kind == TY_UNION)
+    error_tok(ty->name, "returning a struct or union by value is not supported on g2");
+  for (Type *t = ty->params; t; t = t->next)
+    if (t->kind == TY_STRUCT || t->kind == TY_UNION)
+      error_tok(t->name ? t->name : ty->name,
+                "passing a struct or union by value is not supported on g2");
 
   if (consume(&tok, tok, ";"))
     return tok;
 
   current_fn = fn;
+  current_fn_name = NULL;
   locals = NULL;
   enter_scope();
   create_param_lvars(ty->params);
-
-  // A buffer for a struct/union return value is passed
-  // as the hidden first parameter.
-  Type *rty = ty->return_ty;
-  if ((rty->kind == TY_STRUCT || rty->kind == TY_UNION) && rty->size > 16)
-    new_lvar("", pointer_to(rty));
-
   fn->params = locals;
 
-  if (ty->is_variadic)
-    fn->va_area = new_lvar("__va_area__", array_of(ty_char, 136));
-  fn->alloca_bottom = new_lvar("__alloca_size__", pointer_to(ty_char));
-
   tok = skip(tok, "{");
-
-  // [https://www.sigbus.info/n1570#6.4.2.2p1] "__func__" is
-  // automatically defined as a local variable containing the
-  // current function name.
-  push_scope("__func__")->var =
-    new_string_literal(fn->name, array_of(ty_char, strlen(fn->name) + 1));
-
-  // [GNU] __FUNCTION__ is yet another name of __func__.
-  push_scope("__FUNCTION__")->var =
-    new_string_literal(fn->name, array_of(ty_char, strlen(fn->name) + 1));
 
   fn->body = compound_stmt(&tok, tok);
   fn->locals = locals;
@@ -3276,13 +2937,12 @@ static Token *global_variable(Token *tok, Type *basety, VarAttr *attr) {
     Obj *var = new_gvar(get_ident(ty->name), ty);
     var->is_definition = !attr->is_extern;
     var->is_static = attr->is_static;
-    var->is_tls = attr->is_tls;
     if (attr->align)
       var->align = attr->align;
 
     if (equal(tok, "="))
       gvar_initializer(&tok, tok->next, var);
-    else if (!attr->is_extern && !attr->is_tls)
+    else if (!attr->is_extern)
       var->is_tentative = true;
   }
   return tok;
@@ -3326,16 +2986,8 @@ static void scan_globals(void) {
   globals = head.next;
 }
 
-static void declare_builtin_functions(void) {
-  Type *ty = func_type(pointer_to(ty_void));
-  ty->params = copy_type(ty_int);
-  builtin_alloca = new_gvar("alloca", ty);
-  builtin_alloca->is_definition = false;
-}
-
 // program = (typedef | function-definition | global-variable)*
 Obj *parse(Token *tok) {
-  declare_builtin_functions();
   globals = NULL;
 
   while (tok->kind != TK_EOF) {

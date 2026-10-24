@@ -1,21 +1,27 @@
 #include "chibicc.h"
 
+// On g2, the unit of size and alignment is one memory slot (a signed
+// 32-bit integer), not a byte. Every scalar type occupies one slot.
 Type *ty_void = &(Type){TY_VOID, 1, 1};
 Type *ty_bool = &(Type){TY_BOOL, 1, 1};
 
 Type *ty_char = &(Type){TY_CHAR, 1, 1};
-Type *ty_short = &(Type){TY_SHORT, 2, 2};
-Type *ty_int = &(Type){TY_INT, 4, 4};
-Type *ty_long = &(Type){TY_LONG, 8, 8};
+Type *ty_short = &(Type){TY_SHORT, 1, 1};
+Type *ty_int = &(Type){TY_INT, 1, 1};
+Type *ty_long = &(Type){TY_LONG, 1, 1};
 
-Type *ty_uchar = &(Type){TY_CHAR, 1, 1, true};
-Type *ty_ushort = &(Type){TY_SHORT, 2, 2, true};
-Type *ty_uint = &(Type){TY_INT, 4, 4, true};
-Type *ty_ulong = &(Type){TY_LONG, 8, 8, true};
+// g2 has no unsigned arithmetic. The parser rejects the "unsigned"
+// keyword, and these types (still used internally, e.g. for sizeof)
+// are signed.
+Type *ty_uchar = &(Type){TY_CHAR, 1, 1};
+Type *ty_ushort = &(Type){TY_SHORT, 1, 1};
+Type *ty_uint = &(Type){TY_INT, 1, 1};
+Type *ty_ulong = &(Type){TY_LONG, 1, 1};
 
-Type *ty_float = &(Type){TY_FLOAT, 4, 4};
-Type *ty_double = &(Type){TY_DOUBLE, 8, 8};
-Type *ty_ldouble = &(Type){TY_LDOUBLE, 16, 16};
+// Floating-point types exist only so that the parser can reject them.
+Type *ty_float = &(Type){TY_FLOAT, 1, 1};
+Type *ty_double = &(Type){TY_DOUBLE, 1, 1};
+Type *ty_ldouble = &(Type){TY_LDOUBLE, 1, 1};
 
 static Type *new_type(TypeKind kind, int size, int align) {
   Type *ty = calloc(1, sizeof(Type));
@@ -95,9 +101,8 @@ Type *copy_type(Type *ty) {
 }
 
 Type *pointer_to(Type *base) {
-  Type *ty = new_type(TY_PTR, 8, 8);
+  Type *ty = new_type(TY_PTR, 1, 1);
   ty->base = base;
-  ty->is_unsigned = true;
   return ty;
 }
 
@@ -116,15 +121,8 @@ Type *array_of(Type *base, int len) {
   return ty;
 }
 
-Type *vla_of(Type *base, Node *len) {
-  Type *ty = new_type(TY_VLA, 8, 8);
-  ty->base = base;
-  ty->vla_len = len;
-  return ty;
-}
-
 Type *enum_type(void) {
-  return new_type(TY_ENUM, 4, 4);
+  return new_type(TY_ENUM, 1, 1);
 }
 
 Type *struct_type(void) {
@@ -140,24 +138,9 @@ static Type *get_common_type(Type *ty1, Type *ty2) {
   if (ty2->kind == TY_FUNC)
     return pointer_to(ty2);
 
-  if (ty1->kind == TY_LDOUBLE || ty2->kind == TY_LDOUBLE)
-    return ty_ldouble;
-  if (ty1->kind == TY_DOUBLE || ty2->kind == TY_DOUBLE)
-    return ty_double;
-  if (ty1->kind == TY_FLOAT || ty2->kind == TY_FLOAT)
-    return ty_float;
-
-  if (ty1->size < 4)
-    ty1 = ty_int;
-  if (ty2->size < 4)
-    ty2 = ty_int;
-
-  if (ty1->size != ty2->size)
-    return (ty1->size < ty2->size) ? ty2 : ty1;
-
-  if (ty2->is_unsigned)
-    return ty2;
-  return ty1;
+  // All integer types are 32-bit signed on g2, so the usual arithmetic
+  // conversions always produce int.
+  return ty_int;
 }
 
 // For many binary operators, we implicitly promote operands so that
@@ -239,7 +222,6 @@ void add_type(Node *node) {
     node->ty = node->lhs->ty;
     return;
   case ND_VAR:
-  case ND_VLA_PTR:
     node->ty = node->var->ty;
     return;
   case ND_COND:
@@ -283,25 +265,6 @@ void add_type(Node *node) {
       }
     }
     error_tok(node->tok, "statement expression returning void is not supported");
-    return;
-  case ND_LABEL_VAL:
-    node->ty = pointer_to(ty_void);
-    return;
-  case ND_CAS:
-    add_type(node->cas_addr);
-    add_type(node->cas_old);
-    add_type(node->cas_new);
-    node->ty = ty_bool;
-
-    if (node->cas_addr->ty->kind != TY_PTR)
-      error_tok(node->cas_addr->tok, "pointer expected");
-    if (node->cas_old->ty->kind != TY_PTR)
-      error_tok(node->cas_old->tok, "pointer expected");
-    return;
-  case ND_EXCH:
-    if (node->lhs->ty->kind != TY_PTR)
-      error_tok(node->cas_addr->tok, "pointer expected");
-    node->ty = node->lhs->ty->base;
     return;
   }
 }

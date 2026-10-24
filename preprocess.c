@@ -1058,47 +1058,40 @@ static char *format_time(struct tm *tm) {
 }
 
 void init_macros(void) {
-  // Define predefined macros
-  define_macro("_LP64", "1");
+  // Define predefined macros. Sizes are in g2 memory slots (one signed
+  // 32-bit integer each), so every scalar type has size 1.
   define_macro("__C99_MACRO_WITH_VA_ARGS", "1");
-  define_macro("__ELF__", "1");
-  define_macro("__LP64__", "1");
-  define_macro("__SIZEOF_DOUBLE__", "8");
-  define_macro("__SIZEOF_FLOAT__", "4");
-  define_macro("__SIZEOF_INT__", "4");
-  define_macro("__SIZEOF_LONG_DOUBLE__", "8");
-  define_macro("__SIZEOF_LONG_LONG__", "8");
-  define_macro("__SIZEOF_LONG__", "8");
-  define_macro("__SIZEOF_POINTER__", "8");
-  define_macro("__SIZEOF_PTRDIFF_T__", "8");
-  define_macro("__SIZEOF_SHORT__", "2");
-  define_macro("__SIZEOF_SIZE_T__", "8");
-  define_macro("__SIZE_TYPE__", "unsigned long");
-  define_macro("__STDC_HOSTED__", "1");
+  define_macro("__CHAR_BIT__", "32");
+  define_macro("__INT_MAX__", "2147483647");
+  define_macro("__LONG_MAX__", "2147483647");
+  define_macro("__LONG_LONG_MAX__", "2147483647");
+  define_macro("__SCHAR_MAX__", "2147483647");
+  define_macro("__SHRT_MAX__", "2147483647");
+  define_macro("__SIZEOF_INT__", "1");
+  define_macro("__SIZEOF_LONG_LONG__", "1");
+  define_macro("__SIZEOF_LONG__", "1");
+  define_macro("__SIZEOF_POINTER__", "1");
+  define_macro("__SIZEOF_PTRDIFF_T__", "1");
+  define_macro("__SIZEOF_SHORT__", "1");
+  define_macro("__SIZEOF_SIZE_T__", "1");
+  define_macro("__PTRDIFF_TYPE__", "int");
+  define_macro("__SIZE_TYPE__", "int");
+  define_macro("__STDC_HOSTED__", "0");
+  define_macro("__STDC_NO_ATOMICS__", "1");
   define_macro("__STDC_NO_COMPLEX__", "1");
-  define_macro("__STDC_UTF_16__", "1");
-  define_macro("__STDC_UTF_32__", "1");
+  define_macro("__STDC_NO_THREADS__", "1");
+  define_macro("__STDC_NO_VLA__", "1");
   define_macro("__STDC_VERSION__", "201112L");
   define_macro("__STDC__", "1");
   define_macro("__USER_LABEL_PREFIX__", "");
   define_macro("__alignof__", "_Alignof");
-  define_macro("__amd64", "1");
-  define_macro("__amd64__", "1");
   define_macro("__chibicc__", "1");
   define_macro("__const__", "const");
-  define_macro("__gnu_linux__", "1");
+  define_macro("__g2__", "1");
   define_macro("__inline__", "inline");
-  define_macro("__linux", "1");
-  define_macro("__linux__", "1");
   define_macro("__signed__", "signed");
   define_macro("__typeof__", "typeof");
-  define_macro("__unix", "1");
-  define_macro("__unix__", "1");
   define_macro("__volatile__", "volatile");
-  define_macro("__x86_64", "1");
-  define_macro("__x86_64__", "1");
-  define_macro("linux", "1");
-  define_macro("unix", "1");
 
   add_builtin("__FILE__", file_macro);
   add_builtin("__LINE__", line_macro);
@@ -1112,58 +1105,11 @@ void init_macros(void) {
   define_macro("__TIME__", format_time(tm));
 }
 
-typedef enum {
-  STR_NONE, STR_UTF8, STR_UTF16, STR_UTF32, STR_WIDE,
-} StringKind;
-
-static StringKind getStringKind(Token *tok) {
-  if (!strcmp(tok->loc, "u8"))
-    return STR_UTF8;
-
-  switch (tok->loc[0]) {
-  case '"': return STR_NONE;
-  case 'u': return STR_UTF16;
-  case 'U': return STR_UTF32;
-  case 'L': return STR_WIDE;
-  }
-  unreachable();
-}
-
 // Concatenate adjacent string literals into a single string literal
 // as per the C spec.
 static void join_adjacent_string_literals(Token *tok) {
-  // First pass: If regular string literals are adjacent to wide
-  // string literals, regular string literals are converted to a wide
-  // type before concatenation. In this pass, we do the conversion.
-  for (Token *tok1 = tok; tok1->kind != TK_EOF;) {
-    if (tok1->kind != TK_STR || tok1->next->kind != TK_STR) {
-      tok1 = tok1->next;
-      continue;
-    }
-
-    StringKind kind = getStringKind(tok1);
-    Type *basety = tok1->ty->base;
-
-    for (Token *t = tok1->next; t->kind == TK_STR; t = t->next) {
-      StringKind k = getStringKind(t);
-      if (kind == STR_NONE) {
-        kind = k;
-        basety = t->ty->base;
-      } else if (k != STR_NONE && kind != k) {
-        error_tok(t, "unsupported non-standard concatenation of string literals");
-      }
-    }
-
-    if (basety->size > 1)
-      for (Token *t = tok1; t->kind == TK_STR; t = t->next)
-        if (t->ty->base->size == 1)
-          *t = *tokenize_string_literal(t, basety);
-
-    while (tok1->kind == TK_STR)
-      tok1 = tok1->next;
-  }
-
-  // Second pass: concatenate adjacent string literals.
+  // Wide string literals are rejected by the tokenizer, so every string
+  // literal is a plain char array and can be concatenated directly.
   for (Token *tok1 = tok; tok1->kind != TK_EOF;) {
     if (tok1->kind != TK_STR || tok1->next->kind != TK_STR) {
       tok1 = tok1->next;

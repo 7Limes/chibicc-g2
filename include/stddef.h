@@ -3,10 +3,12 @@
 
 #define NULL ((void *)0)
 
-typedef unsigned long size_t;
-typedef long ptrdiff_t;
-typedef unsigned int wchar_t;
-typedef long max_align_t;
+// Sizes on g2 are counted in memory slots, and every integer type is
+// a 32-bit signed int.
+typedef int size_t;
+typedef int ptrdiff_t;
+typedef int wchar_t;
+typedef int max_align_t;
 
 #define offsetof(type, member) ((size_t)&(((type *)0)->member))
 
