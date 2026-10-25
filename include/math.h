@@ -74,43 +74,52 @@ static float fmodf(float x, float y) {
   return result;
 }
 
+// The small functions above are also macros, so they compile inline
+// instead of costing a call. Each argument is evaluated once.
+#define fabsf(x) ({ float __g2_x = (x); __g2_x < 0 ? -__g2_x : __g2_x; })
+#define fminf(x, y) ({ float __g2_x = (x), __g2_y = (y); __g2_x < __g2_y ? __g2_x : __g2_y; })
+#define fmaxf(x, y) ({ float __g2_x = (x), __g2_y = (y); __g2_x > __g2_y ? __g2_x : __g2_y; })
+#define floorf(x) ((float)(int)(x))
+#define ceilf(x) (-floorf(-(x)))
+#define truncf(x) ({ float __g2_x = (x); __g2_x < 0 ? ceilf(__g2_x) : floorf(__g2_x); })
+#define roundf(x) \
+  ({ float __g2_x = (x); __g2_x < 0 ? -floorf(0.5f - __g2_x) : floorf(__g2_x + 0.5f); })
+
 // Rounds down, like the other operations: sqrtf(x) is the largest float
 // whose square is at most x. Returns 0 for x <= 0.
 //
-// The raw result is the integer square root of raw(x) * 2^16, a 47-bit
-// number. It's computed two bits at a time: first the bits of raw(x),
-// then 8 pairs of zero bits. The remainder never exceeds 2^26, so
-// nothing overflows.
+// The raw result is floor(sqrt(raw(x) * 2^16)), which needs 47 bits. The
+// integer square root s of raw(x) comes first, by Newton's method from a
+// power of two above it. Then 8 more bits come one at a time, as in long
+// division, from the remainder raw(x) - s*s. The remainder stays below
+// 2^26, so nothing overflows.
 static float sqrtf(float x) {
   int a = __G2_FBITS(x);
   float result = 0;
   if (a <= 0)
     return result;
 
-  int bit = 1 << 30; // the place of the current pair of bits in a
-  int steps = 24;
-  while (bit > a) {  // leading zero pairs don't change the result
-    bit /= 4;
-    steps--;
+  int s = 1;
+  for (int t = a; t > 0; t /= 4)
+    s *= 2;
+  for (;;) {
+    int next = (s + a / s) / 2;
+    if (next >= s)
+      break;
+    s = next;
   }
 
-  int root = 0;
-  int rem = 0;
-  for (; steps > 0; steps--) {
+  int rem = a - s * s;
+  for (int i = 0; i < 8; i++) {
     rem *= 4;
-    if (bit > 0) {
-      rem += a / bit;
-      a %= bit;
-      bit /= 4;
-    }
-    int trial = root * 4 + 1;
-    root *= 2;
+    int trial = s * 4 + 1;
+    s *= 2;
     if (rem >= trial) {
       rem -= trial;
-      root++;
+      s++;
     }
   }
-  __G2_FBITS(result) = root;
+  __G2_FBITS(result) = s;
   return result;
 }
 

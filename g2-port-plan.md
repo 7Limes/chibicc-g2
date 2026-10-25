@@ -23,7 +23,8 @@ References: `g2asm-spec.md`, `g2-spec.md`, `example/snake_g1.c`, `example/g2.h`.
 
 ### Non-Goals (for now)
 
-- Floating point (`float`, `double`, `long double`).
+- ~~Floating point (`float`, `double`, `long double`).~~ Added later as Q16.16 fixed point; see
+  `g2-float-plan.md`.
 - Unsigned arithmetic semantics (see §3.4).
 - Recursion (not needed, by design; see §3.2).
 - Function pointers (possible later; see §12).
@@ -285,6 +286,7 @@ In practice the first error only happens without `g2.h`, because the header alwa
 ### 4.3 `tokenize.c`
 
 - Remove the float literal path. A floating literal becomes an error ("floating point not supported on g2").
+  *(Superseded: floats are now Q16.16 fixed point; see `g2-float-plan.md`.)*
 - `convert_pp_int`: give every literal type `int`, warn on wrap-around in `[2^31, 2^32)`, and error above
   that. Drop the `u`/`U` suffix, or make it an error, to match §3.4.
 - Character literals: `'a'` is an `int` with value 97. Multi-character and wide literals are errors.
@@ -297,7 +299,7 @@ In practice the first error only happens without `g2.h`, because the header alwa
 
 **Type and feature restrictions** (errors with a source location):
 
-- `float`, `double`, `long double`: error in `declspec`.
+- `float`, `double`, `long double`: error in `declspec`. *(Superseded: floats are now Q16.16 fixed point; see `g2-float-plan.md`.)*
 - `unsigned`: error in `declspec` (phase 1).
 - `_Thread_local`, `_Atomic`, `asm`, VLAs, `alloca`, `__builtin_va_*`, variadic function definitions,
   bitfields, `goto *expr` and `&&label`, and struct/union parameters or return values: errors.
@@ -404,7 +406,7 @@ decl-attr = ... | "g2_load" "(" string-literal "," string-literal "," string-lit
   matters for GNU `void*` arithmetic.
 - Delete `ty_float`, `ty_double`, `ty_ldouble`, or leave them in only so the parser can reject them.
 - `add_type()`: drop the "usual arithmetic conversion" paths for floats. `get_common_type` always
-  returns `ty_int` for integers and keeps pointers as pointers.
+  returns `ty_int` for integers and keeps pointers as pointers. *(Superseded: floats are now Q16.16 fixed point; see `g2-float-plan.md`.)*
 - `struct Obj` gains: `bool has_fixed_addr; int fixed_addr;`, `char *intrinsic;`,
   `bool is_load; char *load_op, *load_type, *load_data;` (from `g2_load`), and backend fields `int addr;`
   (absolute slot address) and `char *asm_name;` (emitted symbol).
@@ -422,6 +424,8 @@ Replace the x86 `include/` headers (`stdarg.h`, `stdatomic.h`, `float.h`, …) w
 - `g2.h`: the hardware interface plus standard library (§3.6, §8). This could move here from `example/`
   so that `#include <g2.h>` works.
 - `__g2rt.h`: compiler runtime helpers (bitwise ops). The driver `-include`s it automatically (§6.6).
+- `float.h`, `math.h`: added with floats (`g2-float-plan.md` §7). `__g2rt.h` also has the
+  fixed-point `*` and `/` helpers.
 
 ---
 
@@ -904,7 +908,7 @@ Defining a function with one of these names is a redefinition error unless `G2_N
 Every unsupported construct should report `error_tok` at the offending token. For example:
 
 ```
-snake.c:12:5: float is not supported on g2
+snake.c:12:5: unsigned types are not supported on g2
 snake.c:40:3: recursion is not supported on g2: tick -> collide_snake -> reset -> collide_snake
 snake.c:51:9: call to undefined function 'next_rand' (g2 has no linker; define it or include its header)
 snake.c:60:1: call depth 18 exceeds the g2 call stack (16)
@@ -1211,7 +1215,7 @@ These are things noticed while planning, not compiler requirements:
 | `type.c` | All scalar and pointer sizes 1. Remove float conversions. |
 | `chibicc.h` | New `Obj` fields (fixed address, intrinsic, load info, addr/asm_name/frame_size). Remove x86 fields. Add the new codegen API. |
 | `codegen.c` → `codegen_g2.c` | Rewritten: memory allocator, frame allocation and overlay, call graph checks, operand-based expression and condition codegen, statement codegen, initialisers, peephole pass, output formatting. |
-| `include/` | Replace with `stddef.h`, `stdbool.h`, `limits.h`, `g2.h`, `__g2rt.h`, `g2lib.h`. |
+| `include/` | Replace with `stddef.h`, `stdbool.h`, `limits.h`, `g2.h`, `__g2rt.h`, `g2lib.h` (later also `float.h` and `math.h`). |
 | `Makefile` | Drop stage2 and the x86 tests. Add the `test-g2` target and the runner. |
 | `test-g2/`, `tools/` | New test suite and headless runner (§11). |
 | `example/g2.h` | Superseded by `include/g2.h`, which uses the attributes and pulls in the library (§3.6). |

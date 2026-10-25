@@ -288,16 +288,17 @@ static int __g2_fmul(int a, int b) {
   int lo1 = al / 256 * bl;          // < 2^24
   int lo0 = al % 256 * bl;          // < 2^24
   int lo = (lo1 + lo0 / 256) / 256; // floor(al * bl / 65536)
-  return ah * bh * 65536 + ah * bl + al * bh + lo;
+  return ah * b + al * bh + lo;
 }
 ```
 
-Why it's exact: `a·b/F = ah·bh·F + ah·bl + al·bh + al·bl/F`, and the first three terms are integers,
-so the floor only applies to the last one. `floor((256·lo1 + lo0) / F) = floor((lo1 + floor(lo0/256))
+Why it's exact: `a·b/F = ah·b + al·bh + al·bl/F` (since `b = bh·F + bl`), and the first two terms are
+integers, so the floor only applies to the last one. `floor((256·lo1 + lo0) / F) = floor((lo1 + floor(lo0/256))
 / 256)`. Every term is exact modulo 2³², so the sum is too.
 
-Possible early exits, to measure before adding: `al == 0` (the left operand is a whole number) skips
-the `lo` computation, and `ah == 0 && bh == 0` skips the first three terms.
+Early exits (`al == 0`, or both high halves 0) were considered in Phase F4 and left out: only
+`var * var` reaches the helper, where whole-number operands are rare, and each check costs every
+other call 2 instructions.
 
 ### 6.2 `__g2_fdiv`
 
@@ -370,7 +371,7 @@ Header-only and `static`, like `g2lib.h`, so unused functions cost nothing. `dou
 |---|---|
 | `fabsf`, `fminf`, `fmaxf`, `copysignf` | raw integer operations |
 | `floorf`, `ceilf`, `truncf`, `roundf`, `fmodf` | raw `div`/`mod` by 65536 (`floorf` is one `div` and one `mul`) |
-| `sqrtf` | bit-by-bit integer square root of `raw · 2^16`, a 48-bit value. Use the 32-bit "shift two bits at a time" algorithm, adapted to signed slots: the root of a non-negative Q16.16 value is at most `181 · F < 2^24`, so the working values fit. Negative input returns 0. |
+| `sqrtf` | `floor(sqrt(raw · 2^16))`, a 47-bit radicand: the integer square root of `raw` by Newton's method with plain integer division, then 8 more bits one at a time from the remainder (which stays below 2^26). Negative input returns 0. |
 | `sinf`, `cosf` | reduce to `[−π/2, π/2]`, then an odd 5th-order polynomial evaluated with inline constant multiplies (§5.2). No table, so no memory or start-up cost. Accuracy target about 1e-4, which is close to the format's resolution. |
 | `atan2f` | polynomial approximation on the octant. Useful for aiming. Lower priority. |
 | `hypotf(x, y)` | scales both by a power of two so the larger magnitude is in [64, 128), where `x*x + y*y` neither overflows nor loses bits, then scales back |
@@ -518,6 +519,26 @@ host build of the same physics with the same fixed-point rules.
    existing rewrites, and that the constant pool shares `__k65536`.
 3. Update `README.md` (dialect notes: floats are Q16.16, multiplication, division and `(int)` floor)
    and the port plan (§1 non-goals, §15 checklist).
+
+*Status:* done, except the README. Notes:
+
+- `sqrtf` now finds the integer square root by Newton's method and only produces the last 8 bits
+  one at a time. It went from ~400 to ~220 instructions, and matched exact square roots on 1.5
+  million inputs in a simulation of g2 arithmetic before going in.
+- `__g2_fmul` computes `ah * b` instead of `ah * bh * 65536 + ah * bl`: 25 instructions per
+  multiplication instead of 28 (verified on 2 million pairs, and by `test-g2/fixed.c`). The early
+  exits were left out (§6.1).
+- `fabsf`, `fminf`, `fmaxf`, `floorf`, `ceilf`, `truncf` and `roundf` are also macros (statement
+  expressions where the argument is used twice), so they compile inline: `floorf` went from 11
+  instructions to 1, and the library functions that use them got cheaper too.
+- Costs now: `sinf`/`cosf` ~170, `atan2f` ~250, `sqrtf` ~220, `hypotf` ~380, `a * b` 25, `a / b` 31.
+  The ball milestone went from 130.6 to 124.6 instructions per frame.
+- The generated code was checked: conversions are one `div` or `mul`, `(int)(a * 4)` is a `mul` and
+  a `div`, and the constant pool shares `__k65536` across a function.
+- `g2-port-plan.md` now points here from its non-goals, the sections that rejected floats, and the
+  `include/` list.
+- `README.md` is still upstream chibicc's README, with no g2 section to add dialect notes to, so it
+  was left alone.
 
 ---
 

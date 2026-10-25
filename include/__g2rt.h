@@ -99,9 +99,12 @@ static int __g2_shr(int a, int n) {
 
 // floor(a * b / 65536). The product needs 64 bits, so both operands are
 // split into a signed high half and a low half in [0, 65536) (exact,
-// because division floors). The low halves' product can reach 2^32, so
-// `al` is split once more into bytes. Every term is exact modulo 2^32,
-// so the sum is too.
+// because division floors):
+//
+//   a * b / 65536 == ah * b + al * bh + al * bl / 65536
+//
+// The low halves' product can reach 2^32, so `al` is split once more into
+// bytes. Every term is exact modulo 2^32, so the sum is too.
 static int __g2_fmul(int a, int b) {
   int ah = a / 65536;
   int al = a % 65536;
@@ -110,7 +113,7 @@ static int __g2_fmul(int a, int b) {
   int lo1 = al / 256 * bl;          // < 2^24
   int lo0 = al % 256 * bl;          // < 2^24
   int lo = (lo1 + lo0 / 256) / 256; // floor(al * bl / 65536)
-  return ah * bh * 65536 + ah * bl + al * bh + lo;
+  return ah * b + al * bh + lo;
 }
 
 // floor(a * 65536 / b). Starts from the integer quotient and remainder
