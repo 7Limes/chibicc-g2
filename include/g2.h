@@ -50,7 +50,7 @@ extern const int DELTA __attribute__((address(11)));
 #endif
 
 // The standard library: min, max, seed_rand, next_rand, hexcolor,
-// int_to_str, rect, line and draw_text. Define G2_NO_STDLIB before
+// int_to_str, float_to_str, rect, line and draw_text. Define G2_NO_STDLIB before
 // including this header to leave it out, e.g. to define functions with
 // the same names.
 #ifndef G2_NO_STDLIB

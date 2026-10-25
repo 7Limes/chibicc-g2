@@ -529,8 +529,10 @@ host build of the same physics with the same fixed-point rules.
   multiplication instead of 28 (verified on 2 million pairs, and by `test-g2/fixed.c`). The early
   exits were left out (§6.1).
 - `fabsf`, `fminf`, `fmaxf`, `floorf`, `ceilf`, `truncf` and `roundf` are also macros (statement
-  expressions where the argument is used twice), so they compile inline: `floorf` went from 11
-  instructions to 1, and the library functions that use them got cheaper too.
+  expressions where the argument is used twice), so they compile inline: `floorf` went from 12
+  executed instructions to 2 (a `div` and a `mul`), and the library functions that use them got
+  cheaper too. (Costs in this section are measured against a baseline of `r = a;`, so they leave
+  out the final copy into the result.)
 - Costs now: `sinf`/`cosf` ~170, `atan2f` ~250, `sqrtf` ~220, `hypotf` ~380, `a * b` 25, `a / b` 31.
   The ball milestone went from 130.6 to 124.6 instructions per frame.
 - The generated code was checked: conversions are one `div` or `mul`, `(int)(a * 4)` is a `mul` and
