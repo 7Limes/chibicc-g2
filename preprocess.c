@@ -1131,6 +1131,7 @@ void init_macros(void) {
   define_macro("__chibicc__", "1");
   define_macro("__const__", "const");
   define_macro("__g2__", "1");
+  define_macro("__G2_FIXED_FRAC_BITS__", "16");
   define_macro("__inline__", "inline");
   define_macro("__signed__", "signed");
   define_macro("__typeof__", "typeof");

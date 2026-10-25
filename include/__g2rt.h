@@ -90,6 +90,12 @@ static int __g2_shr(int a, int n) {
 // a constant or a converted integer. The results are exactly those of
 // the compiler's constant folding, rounded toward negative infinity and
 // wrapped to 32 bits.
+//
+// __G2_FBITS(v) is the raw value of the float lvalue v, as an int lvalue.
+// __G2_RAW(n) is the float whose raw value is the integer constant n: an
+// integer times a float uses the integer itself, so this folds to n.
+#define __G2_FBITS(v) (*(int *)&(v))
+#define __G2_RAW(n) ((n) * 0x1p-16f)
 
 // floor(a * b / 65536). The product needs 64 bits, so both operands are
 // split into a signed high half and a low half in [0, 65536) (exact,

@@ -78,6 +78,57 @@ static void int_to_str(int *dest, int x) {
   }
 }
 
+// Writes x with `decimals` digits after the point (0 to 4, rounded half
+// up) to dest as a length-prefixed string, e.g. "-12.50". dest needs
+// room for 12 slots.
+static void float_to_str(int *dest, float x, int decimals) {
+  if (decimals < 0)
+    decimals = 0;
+  if (decimals > 4)
+    decimals = 4;
+  int scale = 1;
+  for (int i = 0; i < decimals; i++)
+    scale *= 10;
+
+  // Split |x| into a whole part and a fraction in [0, 65536), without
+  // negating the raw value, which overflows for -32768.0.
+  int raw = __G2_FBITS(x);
+  int whole = raw / 65536;
+  int frac = raw % 65536;
+  int negative = raw < 0;
+  if (negative) {
+    whole = -whole;
+    if (frac) {
+      whole--;
+      frac = 65536 - frac;
+    }
+  }
+
+  int digits = (frac * scale + 32768) / 65536;
+  if (digits == scale) {
+    whole++;
+    digits = 0;
+  }
+  if (whole == 0 && digits == 0)
+    negative = 0;
+
+  int_to_str(dest + negative, whole);
+  if (negative) {
+    dest[0] = dest[1] + 1;
+    dest[1] = '-';
+  }
+  if (decimals == 0)
+    return;
+
+  int n = dest[0];
+  dest[n + 1] = '.';
+  for (int i = decimals; i > 0; i--) {
+    dest[n + 1 + i] = digits % 10 + '0';
+    digits /= 10;
+  }
+  dest[0] = n + 1 + decimals;
+}
+
 //
 // Graphics
 //

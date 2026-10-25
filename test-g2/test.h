@@ -18,6 +18,19 @@ static void assert_eq(int line, int expected, int actual) {
 
 #define ASSERT(x, y) assert_eq(__LINE__, x, y)
 
+// Passes if |expected - actual| <= tolerance.
+static void assert_near(int line, int expected, int actual, int tolerance) {
+  int diff = expected - actual;
+  if (diff < 0)
+    diff = -diff;
+  if (diff > tolerance)
+    assert_eq(line, expected, actual);
+  else
+    assert_eq(line, actual, actual);
+}
+
+#define ASSERT_NEAR(x, y, tolerance) assert_near(__LINE__, x, y, tolerance)
+
 // The raw Q16.16 value of a float: fbits(1.5) == 98304.
 static int fbits(float f) { return *(int *)&f; }
 
