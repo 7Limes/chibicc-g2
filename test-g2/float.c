@@ -174,4 +174,44 @@ void start() {
   ASSERT(0, fbits(0x1p-16 * 0.5));
   ASSERT(6, (int)(2.5 * 2.5));
   ASSERT(4, sizeof(int[(int)(1.5 * 3)]));
+
+  // * and / at run time (test-g2/fixed.c checks them exhaustively)
+  float m = fid(1.5);
+  ASSERT(245760, fbits(m * fid(2.5)));
+  ASSERT(-21846, fbits(fid(-1.0) / 3));
+  ASSERT(21845, fbits(fid(1.0) / fid(3.0)));
+  ASSERT(147456, fbits(m * id(3) / 2));
+  m *= 2;
+  ASSERT(196608, fbits(m));
+  m /= fid(4);
+  ASSERT(49152, fbits(m));
+  m *= m;
+  ASSERT(36864, fbits(m));
+  m = fid(10);
+  m /= 0.5;
+  ASSERT(1310720, fbits(m));
+  m *= 1.3;    // raw 85197
+  ASSERT(1703940, fbits(m));
+  arr[id(1)] *= fid(-0.5);
+  ASSERT(-114688, fbits(arr[1]));
+  pt.y /= pt.x;
+  ASSERT(49152, fbits(pt.y));
+
+  int k = 7;
+  k *= 1.5;      // k = (int)(7.0 * 1.5)
+  ASSERT(10, k);
+  k /= 0.25;
+  ASSERT(40, k);
+
+  // Helper calls inside the arguments of another call
+  // 3.75 + (int)1.125
+  ASSERT(311296, fbits(add_int(fid(1.5) * fid(2.5), id(3) * 1.5 / fid(4))));
+
+  // With an integer operand, the integer itself is used, so the result
+  // is exact even beyond the range of (float)n. Folding agrees.
+  ASSERT(-2001207296, fbits(id(70000) * 0.5));
+  ASSERT(-2001207296, fbits(70000 * 0.5));
+  ASSERT(65536, fbits(fid(2.0) / id(2)));
+  ASSERT(1, fbits(fid(1.0) / id(65536)));
+  ASSERT(1, fbits(1.0 / 65536));
 }

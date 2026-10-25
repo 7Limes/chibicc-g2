@@ -307,6 +307,7 @@ int64_t fix_to_int(int64_t raw);
 int64_t fix_mul(int64_t a, int64_t b);
 int64_t fix_div(Node *node, int64_t a, int64_t b);
 int64_t convert_const(Node *node, Type *from, int64_t val);
+bool is_int_to_float(Node *node);
 int64_t const_expr(Token **rest, Token *tok);
 Obj *parse(Token *tok);
 

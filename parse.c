@@ -1759,6 +1759,16 @@ int64_t fix_div(Node *node, int64_t a, int64_t b) {
   return floor_div(node, a * FIX_ONE, b);
 }
 
+// True for a conversion from an integer to a floating type. When one
+// operand of a floating * or / is such a conversion, the operation uses
+// the integer itself: a * (float)n is the raw a * n, and a / (float)n is
+// floor(a / n). This is exact and cheap, and stays exact even when
+// (float)n alone would overflow. Constant folding and codegen must agree
+// on this.
+bool is_int_to_float(Node *node) {
+  return node->kind == ND_CAST && is_flonum(node->ty) && is_integer(node->lhs->ty);
+}
+
 // Converts the constant `val` of type `from` to the type of the cast
 // `node`.
 int64_t convert_const(Node *node, Type *from, int64_t val) {
@@ -1797,12 +1807,20 @@ static int64_t eval2(Node *node, char ***label) {
   case ND_SUB:
     return wrap32((uint64_t)eval2(node->lhs, label) - (uint64_t)eval(node->rhs));
   case ND_MUL:
-    if (is_flonum(node->ty))
+    if (is_flonum(node->ty)) {
+      if (is_int_to_float(node->lhs))
+        return wrap32((uint64_t)eval(node->lhs->lhs) * (uint64_t)eval(node->rhs));
+      if (is_int_to_float(node->rhs))
+        return wrap32((uint64_t)eval(node->lhs) * (uint64_t)eval(node->rhs->lhs));
       return fix_mul(eval(node->lhs), eval(node->rhs));
+    }
     return wrap32((uint64_t)eval(node->lhs) * (uint64_t)eval(node->rhs));
   case ND_DIV:
-    if (is_flonum(node->ty))
+    if (is_flonum(node->ty)) {
+      if (is_int_to_float(node->rhs))
+        return floor_div(node, eval(node->lhs), eval(node->rhs->lhs));
       return fix_div(node, eval(node->lhs), eval(node->rhs));
+    }
     return floor_div(node, eval(node->lhs), eval(node->rhs));
   case ND_NEG:
     return wrap32(-(uint64_t)eval(node->lhs));

@@ -405,6 +405,33 @@ static bool is_compound_assign(Node *node) {
          !*node->lhs->var->name && strip_casts(node->rhs)->kind == ND_ADDR;
 }
 
+static bool const_int(Node *node, int64_t *val);
+
+// Floating * and / of constants, with the same rules as eval2 in parse.c
+// (see is_int_to_float).
+static bool const_fixed_arith(Node *node, int64_t *val) {
+  bool is_mul = node->kind == ND_MUL;
+  Node *l = node->lhs;
+  Node *r = node->rhs;
+  if (is_mul && is_int_to_float(l)) {
+    Node *tmp = l;
+    l = r;
+    r = tmp;
+  }
+
+  int64_t a, b;
+  if (is_int_to_float(r)) {
+    if (!const_int(l, &a) || !const_int(r->lhs, &b) || (!is_mul && b == 0))
+      return false;
+    *val = is_mul ? wrap32((uint64_t)a * b) : floor_div(NULL, a, b);
+    return true;
+  }
+  if (!const_int(l, &a) || !const_int(r, &b) || (!is_mul && b == 0))
+    return false;
+  *val = is_mul ? fix_mul(a, b) : fix_div(NULL, a, b);
+  return true;
+}
+
 static bool const_int(Node *node, int64_t *val) {
   int64_t a, b;
   switch (node->kind) {
@@ -425,17 +452,21 @@ static bool const_int(Node *node, int64_t *val) {
       return false;
     *val = wrap32(-(uint64_t)a);
     return true;
+  case ND_MUL:
+  case ND_DIV:
+    if (is_flonum(node->ty))
+      return const_fixed_arith(node, val);
+    if (node->kind == ND_DIV)
+      return false;
+    // fallthrough
   case ND_ADD:
   case ND_SUB:
-  case ND_MUL:
     if (!const_int(node->lhs, &a) || !const_int(node->rhs, &b))
       return false;
     if (node->kind == ND_ADD)
       *val = wrap32((uint64_t)a + (uint64_t)b);
     else if (node->kind == ND_SUB)
       *val = wrap32((uint64_t)a - (uint64_t)b);
-    else if (is_flonum(node->ty))
-      *val = fix_mul(a, b);
     else
       *val = wrap32((uint64_t)a * (uint64_t)b);
     return true;
@@ -974,11 +1005,6 @@ static Operand gen_arith(Node *node, Operand *hint) {
 
   NodeKind kind = node->kind;
 
-  // Floating + and - are integer operations on the raw Q16.16 values,
-  // but * and / need a rescaling step.
-  if (is_flonum(node->ty) && (kind == ND_MUL || kind == ND_DIV))
-    unsupported(node, "floating-point multiplication and division");
-
   // Put the constant of a commutative operator on the right.
   if ((kind == ND_ADD || kind == ND_MUL) && a.is_imm) {
     Operand tmp = a;
@@ -1179,7 +1205,7 @@ static Operand gen_ternary(Node *node, Operand *hint) {
 //   x & -m   x / m * m              if m is a power of two
 //
 // Everything else is rewritten into a call to a runtime helper in
-// __g2rt.h (see lower_bitwise).
+// __g2rt.h (see lower_helpers).
 
 static bool is_bitwise(NodeKind kind) {
   return kind == ND_BITAND || kind == ND_BITOR || kind == ND_BITXOR ||
@@ -1247,7 +1273,7 @@ static Operand gen_bitwise(Node *node, Operand *hint) {
     b = tmp;
   }
 
-  // lower_bitwise turned every other case into a helper call.
+  // lower_helpers turned every other case into a helper call.
   if (!b.is_imm || !bitwise_inline(node->kind, b.imm))
     unreachable();
 
@@ -1309,6 +1335,181 @@ static Operand gen_bitwise(Node *node, Operand *hint) {
   unreachable();
 }
 
+//
+// Floating-point multiplication and division
+//
+// Floats are Q16.16 fixed point (F = 65536), so on the raw values a * b
+// is floor(a * b / F) and a / b is floor(a * F / b). These cases compile
+// inline, giving exactly the same results as the helpers:
+//
+//   a * (float)n   a * n                since a * nF / F == a * n
+//   a / (float)n   a / n                since a * F / nF == a / n
+//   a * C          see gen_fixed_mul_const
+//   a / nF         a / n
+//   a / ±2^k       a * ±2^(16 - k)      for k < 16
+//
+// Everything else is rewritten into a call to __g2_fmul or __g2_fdiv
+// (see lower_helpers).
+
+static bool is_fixed_arith(Node *node) {
+  return (node->kind == ND_MUL || node->kind == ND_DIV) && is_flonum(node->ty);
+}
+
+// Returns ±2^(16 - k) if c is ±2^k with k < 16, or 0. Then
+// floor(a * c / F) == floor(a / s) and floor(a * F / c) == a * s.
+static int64_t fixed_pow2_scale(int64_t c) {
+  int k = log2_exact(c < 0 ? -c : c);
+  if (k < 0 || k >= 16)
+    return 0;
+  return (c < 0 ? -1 : 1) * ((int64_t)1 << (16 - k));
+}
+
+// The integer conversions are checked first: const_int would convert
+// them, which warns if the value doesn't fit in a float.
+static bool fixed_needs_helper(Node *node) {
+  int64_t k;
+  if (node->kind == ND_MUL)
+    return !is_int_to_float(node->lhs) && !is_int_to_float(node->rhs) &&
+           !const_int(node->lhs, &k) && !const_int(node->rhs, &k);
+  if (is_int_to_float(node->rhs))
+    return false;
+  if (const_int(node->rhs, &k))
+    return k != 0 && k % FIX_ONE != 0 && !fixed_pow2_scale(k);
+  return true;
+}
+
+// a * k for an integer k.
+static Operand mul_const(Operand a, int64_t k, Operand *hint) {
+  k = wrap32(k);
+  if (a.is_imm)
+    return imm(wrap32((uint64_t)a.imm * k));
+  if (k == 0) {
+    free_op(a);
+    return imm(0);
+  }
+  if (k == 1)
+    return a;
+  free_op(a);
+  Operand d = dest(hint);
+  if (k == -1)
+    emit("sub %s %s %s", d.name, SLOT_ZERO, a.name);
+  else
+    emit_imm_op("mul", d.name, a.name, k);
+  return d;
+}
+
+// floor(a / k) for an integer k != 0.
+static Operand div_const(Operand a, int64_t k, Operand *hint) {
+  if (a.is_imm)
+    return imm(floor_div(NULL, a.imm, k));
+  if (k == 1)
+    return a;
+  free_op(a);
+  Operand d = dest(hint);
+  if (k == -1)
+    emit("sub %s %s %s", d.name, SLOT_ZERO, a.name);
+  else
+    emit_imm_op("div", d.name, a.name, k);
+  return d;
+}
+
+// floor(a * c / F) for a constant c. Write c = n*F + f with f in
+// [-F/2, F/2), and split a into ah = a / F and al = a % F (in [0, F)).
+// Then
+//
+//   floor(a * c / F) == a*n + ah*f + floor(al*f / F)
+//
+// |al * f| < 2^31, so only the result itself can overflow, and it wraps
+// like the helper's.
+static Operand gen_fixed_mul_const(Operand a, int64_t c, Operand *hint) {
+  if (c % FIX_ONE == 0)
+    return mul_const(a, c / FIX_ONE, hint);
+  int64_t s = fixed_pow2_scale(c);
+  if (s)
+    return div_const(a, s, hint);
+
+  int64_t n = floor_div(NULL, c + FIX_ONE / 2, FIX_ONE);
+  int64_t f = c - n * FIX_ONE;
+
+  Operand hi = new_temp();
+  Operand lo = new_temp();
+  emit_imm_op("div", hi.name, a.name, FIX_ONE);
+  emit_imm_op("mod", lo.name, a.name, FIX_ONE);
+  emit_imm_op("mul", hi.name, hi.name, f);
+  emit_imm_op("mul", lo.name, lo.name, f);
+  emit_imm_op("div", lo.name, lo.name, FIX_ONE);
+
+  if (n == 0) {
+    free_op(a);
+    free_op(hi);
+    free_op(lo);
+    Operand d = dest(hint);
+    emit("add %s %s %s", d.name, hi.name, lo.name);
+    return d;
+  }
+
+  emit("add %s %s %s", hi.name, hi.name, lo.name);
+  free_op(lo);
+  Operand an = mul_const(a, n, NULL);
+  free_op(hi);
+  free_op(an);
+  Operand d = dest(hint);
+  emit("add %s %s %s", d.name, an.name, hi.name);
+  return d;
+}
+
+// Floating * and / that lower_helpers left inline.
+static Operand gen_fixed_arith(Node *node, Operand *hint) {
+  bool is_mul = node->kind == ND_MUL;
+  Node *l = node->lhs;
+  Node *r = node->rhs;
+  int64_t k;
+
+  if (const_int(node, &k))
+    return imm(k);
+
+  // Put a converted integer, or else a constant, on the right.
+  if (is_mul && !is_int_to_float(r) && (is_int_to_float(l) || const_int(l, &k))) {
+    Node *tmp = l;
+    l = r;
+    r = tmp;
+  }
+
+  // a * (float)n == a * n, and a / (float)n == a / n (see is_int_to_float).
+  if (is_int_to_float(r)) {
+    Operand a = gen_expr(l, NULL);
+    Operand n = gen_expr(r->lhs, NULL);
+    if (n.is_imm) {
+      if (!is_mul && n.imm == 0)
+        error_tok(r->tok, "division by zero");
+      return is_mul ? mul_const(a, n.imm, hint) : div_const(a, n.imm, hint);
+    }
+    if (is_mul && a.is_imm)
+      return mul_const(n, a.imm, hint);
+    a = to_slot(a);
+    free_op(a);
+    free_op(n);
+    Operand d = dest(hint);
+    emit("%s %s %s %s", is_mul ? "mul" : "div", d.name, a.name, n.name);
+    return d;
+  }
+
+  // lower_helpers turned every other case into a helper call.
+  if (!const_int(r, &k))
+    unreachable();
+  if (!is_mul && k == 0)
+    error_tok(r->tok, "division by zero");
+
+  Operand a = gen_expr(l, NULL);
+  if (a.is_imm)
+    return imm(fold(node, a.imm, k));
+  if (is_mul)
+    return gen_fixed_mul_const(a, k, hint);
+  if (k % FIX_ONE == 0)
+    return div_const(a, k / FIX_ONE, hint);
+  return mul_const(a, fixed_pow2_scale(k), hint);
+}
+
 static HashMap helper_fns; // name -> Obj for the functions in __g2rt.h
 
 static char *helper_name(NodeKind kind) {
@@ -1318,32 +1519,37 @@ static char *helper_name(NodeKind kind) {
   case ND_BITXOR: return "__g2_xor";
   case ND_SHL: return "__g2_shl";
   case ND_SHR: return "__g2_shr";
+  case ND_MUL: return "__g2_fmul";
+  case ND_DIV: return "__g2_fdiv";
   }
   unreachable();
 }
 
-// Rewrites bitwise operators that can't be compiled inline into calls to
-// the runtime helpers, and marks the helpers live. This happens before
+// Rewrites bitwise operators and floating * and / that can't be compiled
+// inline into calls to the runtime helpers, and marks the helpers live. This happens before
 // any code is generated, so the helpers get frames and appear in the
 // call graph like any other function.
-static bool lower_bitwise(Node *node) {
+static bool lower_helpers(Node *node) {
   if (!node)
     return false;
 
   bool changed = false;
-  changed |= lower_bitwise(node->lhs);
-  changed |= lower_bitwise(node->rhs);
-  changed |= lower_bitwise(node->cond);
-  changed |= lower_bitwise(node->then);
-  changed |= lower_bitwise(node->els);
-  changed |= lower_bitwise(node->init);
-  changed |= lower_bitwise(node->inc);
+  changed |= lower_helpers(node->lhs);
+  changed |= lower_helpers(node->rhs);
+  changed |= lower_helpers(node->cond);
+  changed |= lower_helpers(node->then);
+  changed |= lower_helpers(node->els);
+  changed |= lower_helpers(node->init);
+  changed |= lower_helpers(node->inc);
   for (Node *n = node->body; n; n = n->next)
-    changed |= lower_bitwise(n);
+    changed |= lower_helpers(n);
   for (Node *n = node->args; n; n = n->next)
-    changed |= lower_bitwise(n);
+    changed |= lower_helpers(n);
 
-  if (!is_bitwise(node->kind) || !bitwise_needs_helper(node))
+  bool needs_helper = is_bitwise(node->kind) ? bitwise_needs_helper(node)
+                     : is_fixed_arith(node) ? fixed_needs_helper(node)
+                     : false;
+  if (!needs_helper)
     return changed;
 
   char *name = helper_name(node->kind);
@@ -1576,10 +1782,13 @@ static Operand gen_expr(Node *node, Operand *hint) {
   case ND_MEMZERO:
     gen_memzero(node->var, calloc(node->var->ty->size, sizeof(bool)));
     return imm(0);
-  case ND_ADD:
-  case ND_SUB:
   case ND_MUL:
   case ND_DIV:
+    if (is_flonum(node->ty))
+      return gen_fixed_arith(node, hint);
+    return gen_arith(node, hint);
+  case ND_ADD:
+  case ND_SUB:
   case ND_MOD:
     return gen_arith(node, hint);
   case ND_NEG: {
@@ -2488,7 +2697,7 @@ void codegen(Obj *prog, int width, int height, FILE *outfile) {
   for (Obj *obj = prog; obj; obj = obj->next)
     objs[--k] = obj;
 
-  // Lower bitwise operators to helper calls. Repeat while new helpers
+  // Lower bitwise operators and floating * and / to helper calls. Repeat while new helpers
   // become live, since they need lowering too.
   for (int i = 0; i < nobjs; i++)
     if (objs[i]->is_function && objs[i]->is_definition && !strncmp(objs[i]->name, "__g2_", 5))
@@ -2499,7 +2708,7 @@ void codegen(Obj *prog, int width, int height, FILE *outfile) {
     for (int i = 0; i < nobjs; i++) {
       Obj *fn = objs[i];
       if (fn->is_function && fn->is_definition && fn->is_live)
-        changed |= lower_bitwise(fn->body);
+        changed |= lower_helpers(fn->body);
     }
   }
 
