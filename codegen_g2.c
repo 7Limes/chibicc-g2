@@ -414,9 +414,12 @@ static bool const_int(Node *node, int64_t *val) {
   case ND_CAST:
     // chibicc's usual arithmetic conversion casts the integer operand of
     // pointer arithmetic to the pointer type.
-    if ((!is_integer(node->ty) && node->ty->kind != TY_PTR) || node->ty->kind == TY_BOOL)
+    if (!is_numeric(node->ty) && node->ty->kind != TY_PTR)
       return false;
-    return const_int(node->lhs, val);
+    if (node->ty->kind == TY_BOOL || !const_int(node->lhs, val))
+      return false;
+    *val = convert_const(node, node->lhs->ty, *val);
+    return true;
   case ND_NEG:
     if (!const_int(node->lhs, &a))
       return false;
@@ -431,6 +434,8 @@ static bool const_int(Node *node, int64_t *val) {
       *val = wrap32((uint64_t)a + (uint64_t)b);
     else if (node->kind == ND_SUB)
       *val = wrap32((uint64_t)a - (uint64_t)b);
+    else if (is_flonum(node->ty))
+      *val = fix_mul(a, b);
     else
       *val = wrap32((uint64_t)a * (uint64_t)b);
     return true;
@@ -922,8 +927,14 @@ static int64_t fold(Node *node, int64_t a, int64_t b) {
   switch (node->kind) {
   case ND_ADD: return wrap32((uint64_t)a + (uint64_t)b);
   case ND_SUB: return wrap32((uint64_t)a - (uint64_t)b);
-  case ND_MUL: return wrap32((uint64_t)a * (uint64_t)b);
-  case ND_DIV: return floor_div(node, a, b);
+  case ND_MUL:
+    if (is_flonum(node->ty))
+      return fix_mul(a, b);
+    return wrap32((uint64_t)a * (uint64_t)b);
+  case ND_DIV:
+    if (is_flonum(node->ty))
+      return fix_div(node, a, b);
+    return floor_div(node, a, b);
   case ND_MOD: return floor_mod(node, a, b);
   case ND_BITAND: return a & b;
   case ND_BITOR: return a | b;
@@ -941,6 +952,19 @@ static int64_t fold(Node *node, int64_t a, int64_t b) {
   unreachable();
 }
 
+// Converts between an integer and a Q16.16 float: int -> float multiplies
+// by 65536 and float -> int divides by it, which rounds toward negative
+// infinity.
+static Operand gen_fixed_conversion(Node *node, Operand *hint) {
+  Operand a = gen_expr(node->lhs, NULL);
+  if (a.is_imm)
+    return imm(convert_const(node, node->lhs->ty, a.imm));
+  free_op(a);
+  Operand d = dest(hint);
+  emit_imm_op(is_flonum(node->ty) ? "mul" : "div", d.name, a.name, FIX_ONE);
+  return d;
+}
+
 static Operand gen_arith(Node *node, Operand *hint) {
   Operand a = gen_expr(node->lhs, NULL);
   Operand b = gen_expr(node->rhs, NULL);
@@ -949,6 +973,11 @@ static Operand gen_arith(Node *node, Operand *hint) {
     return imm(fold(node, a.imm, b.imm));
 
   NodeKind kind = node->kind;
+
+  // Floating + and - are integer operations on the raw Q16.16 values,
+  // but * and / need a rescaling step.
+  if (is_flonum(node->ty) && (kind == ND_MUL || kind == ND_DIV))
+    unsupported(node, "floating-point multiplication and division");
 
   // Put the constant of a commutative operator on the right.
   if ((kind == ND_ADD || kind == ND_MUL) && a.is_imm) {
@@ -1511,7 +1540,10 @@ static Operand gen_expr(Node *node, Operand *hint) {
       return gen_truth(node->lhs, false, hint);
     if (node->ty->kind == TY_STRUCT || node->ty->kind == TY_UNION)
       unsupported(node, "struct and union values");
-    // All other scalar types are 32-bit integers, so the cast is a no-op.
+    if (is_flonum(node->ty) != is_flonum(node->lhs->ty))
+      return gen_fixed_conversion(node, hint);
+    // All other scalar types are 32-bit integers (or floats converted to
+    // floats), so the cast is a no-op.
     return gen_expr(node->lhs, hint);
   case ND_COMMA:
     if (is_compound_assign(node->lhs))

@@ -342,11 +342,36 @@ static void convert_pp_number(Token *tok) {
     return;
 
   // If it's not an integer, it must be a floating point constant.
+  // Floats on g2 are Q16.16 fixed point: the token's value is the raw
+  // 32-bit integer round(x * 65536).
   char *end;
-  strtold(tok->loc, &end);
+  long double fval = strtold(tok->loc, &end);
+
+  Type *ty;
+  if (*end == 'f' || *end == 'F') {
+    ty = ty_float;
+    end++;
+  } else if (*end == 'l' || *end == 'L') {
+    ty = ty_ldouble;
+    end++;
+  } else {
+    ty = ty_double;
+  }
+
   if (tok->loc + tok->len != end)
     error_tok(tok, "invalid numeric constant");
-  error_tok(tok, "floating-point constants are not supported on g2");
+
+  long double scaled = fval * FIX_ONE;
+  if (scaled >= INT32_MAX + 0.5L)
+    error_tok(tok, "floating constant %.*s is out of range for g2 fixed point"
+              " (-32768 to 32767.99998)", tok->len, tok->loc);
+  int64_t raw = (int64_t)(scaled + 0.5L);
+  if (raw == 0 && fval != 0)
+    warn_tok(tok, "floating constant %.*s rounds to 0", tok->len, tok->loc);
+
+  tok->kind = TK_NUM;
+  tok->val = raw;
+  tok->ty = ty;
 }
 
 void convert_pp_tokens(Token *tok) {

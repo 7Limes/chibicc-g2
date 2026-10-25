@@ -134,6 +134,7 @@ static Node *stmt(Token **rest, Token *tok);
 static Node *expr_stmt(Token **rest, Token *tok);
 static Node *expr(Token **rest, Token *tok);
 static int64_t eval(Node *node);
+static int64_t eval_int(Node *node);
 static int64_t eval2(Node *node, char ***label);
 static int64_t eval_rval(Node *node, char ***label);
 static bool is_const_expr(Node *node);
@@ -251,6 +252,12 @@ static Node *new_var_node(Obj *var, Token *tok) {
 
 Node *new_cast(Node *expr, Type *ty) {
   add_type(expr);
+
+  Type *from = expr->ty;
+  bool from_ptr = from->base || from->kind == TY_FUNC;
+  bool to_ptr = ty->base || ty->kind == TY_FUNC;
+  if ((is_flonum(ty) && from_ptr) || (to_ptr && is_flonum(from)))
+    error_tok(expr->tok, "cannot convert between a pointer and a floating type");
 
   Node *node = calloc(1, sizeof(Node));
   node->kind = ND_CAST;
@@ -402,6 +409,8 @@ static Type *declspec(Token **rest, Token *tok, VarAttr *attr) {
     SHORT    = 1 << 6,
     INT      = 1 << 8,
     LONG     = 1 << 10,
+    FLOAT    = 1 << 12,
+    DOUBLE   = 1 << 14,
     OTHER    = 1 << 16,
     SIGNED   = 1 << 17,
   };
@@ -502,8 +511,10 @@ static Type *declspec(Token **rest, Token *tok, VarAttr *attr) {
       counter += INT;
     else if (equal(tok, "long"))
       counter += LONG;
-    else if (equal(tok, "float") || equal(tok, "double"))
-      error_tok(tok, "floating point is not supported on g2");
+    else if (equal(tok, "float"))
+      counter += FLOAT;
+    else if (equal(tok, "double"))
+      counter += DOUBLE;
     else if (equal(tok, "signed"))
       counter |= SIGNED;
     else if (equal(tok, "unsigned"))
@@ -542,6 +553,15 @@ static Type *declspec(Token **rest, Token *tok, VarAttr *attr) {
     case SIGNED + LONG + LONG:
     case SIGNED + LONG + LONG + INT:
       ty = ty_long;
+      break;
+    case FLOAT:
+      ty = ty_float;
+      break;
+    case DOUBLE:
+      ty = ty_double;
+      break;
+    case LONG + DOUBLE:
+      ty = ty_ldouble;
       break;
     default:
       error_tok(tok, "invalid type");
@@ -621,7 +641,7 @@ static Type *array_dimensions(Token **rest, Token *tok, Type *ty) {
 
   if (!is_const_expr(expr))
     error_tok(expr->tok, "variable-length arrays are not supported on g2");
-  return array_of(ty, eval(expr));
+  return array_of(ty, eval_int(expr));
 }
 
 // type-suffix = "(" func-params
@@ -1329,11 +1349,17 @@ write_gvar_data(Relocation *cur, Initializer *init, Type *ty, int32_t *buf, int 
   if (!init->expr)
     return cur;
 
+  // Convert the value to the variable's type, e.g. `int x = 2.7;` or
+  // `float f = 3;`.
+  Node *expr = init->expr;
+  if (is_numeric(ty))
+    expr = new_cast(expr, ty);
+
   char **label = NULL;
-  int64_t val = eval2(init->expr, &label);
+  int64_t val = eval2(expr, &label);
 
   if (!label) {
-    buf[offset] = (ty->kind == TY_BOOL) ? (val != 0) : val;
+    buf[offset] = val;
     return cur;
   }
 
@@ -1427,6 +1453,9 @@ static Node *stmt(Token **rest, Token *tok) {
     Node *node = new_node(ND_SWITCH, tok);
     tok = skip(tok->next, "(");
     node->cond = expr(&tok, tok);
+    add_type(node->cond);
+    if (is_flonum(node->cond->ty))
+      error_tok(node->cond->tok, "switch quantity is not an integer");
     tok = skip(tok, ")");
 
     Node *sw = current_switch;
@@ -1700,6 +1729,49 @@ int64_t floor_mod(Node *node, int64_t a, int64_t b) {
   return r;
 }
 
+// Q16.16 fixed point. The runtime helpers in __g2rt.h and the inline
+// sequences in codegen give exactly the same results, so folded and
+// unfolded code agree.
+
+// int -> float. Values outside -32768..32767 wrap around.
+int64_t fix_from_int(Node *node, int64_t n) {
+  int64_t raw = wrap32((uint64_t)n * FIX_ONE);
+  if (raw != n * FIX_ONE && !node->warned) {
+    node->warned = true;
+    warn_tok(node->tok, "conversion of %ld to float wraps around (g2 floats range"
+             " from -32768 to 32767.99998)", (long)n);
+  }
+  return raw;
+}
+
+// float -> int rounds toward negative infinity, like g2's division.
+int64_t fix_to_int(int64_t raw) {
+  return floor_div(NULL, raw, FIX_ONE);
+}
+
+// floor(a * b / 65536). The product fits in 64 bits.
+int64_t fix_mul(int64_t a, int64_t b) {
+  return wrap32(floor_div(NULL, a * b, FIX_ONE));
+}
+
+// floor(a * 65536 / b).
+int64_t fix_div(Node *node, int64_t a, int64_t b) {
+  return floor_div(node, a * FIX_ONE, b);
+}
+
+// Converts the constant `val` of type `from` to the type of the cast
+// `node`.
+int64_t convert_const(Node *node, Type *from, int64_t val) {
+  Type *to = node->ty;
+  if (to->kind == TY_BOOL)
+    return val != 0;
+  if (is_flonum(to) && !is_flonum(from))
+    return fix_from_int(node, val);
+  if (!is_flonum(to) && is_flonum(from))
+    return fix_to_int(val);
+  return wrap32(val);
+}
+
 static int64_t shift_count(Node *node) {
   int64_t n = eval(node->rhs);
   if (n < 0 || n > 31)
@@ -1725,8 +1797,12 @@ static int64_t eval2(Node *node, char ***label) {
   case ND_SUB:
     return wrap32((uint64_t)eval2(node->lhs, label) - (uint64_t)eval(node->rhs));
   case ND_MUL:
+    if (is_flonum(node->ty))
+      return fix_mul(eval(node->lhs), eval(node->rhs));
     return wrap32((uint64_t)eval(node->lhs) * (uint64_t)eval(node->rhs));
   case ND_DIV:
+    if (is_flonum(node->ty))
+      return fix_div(node, eval(node->lhs), eval(node->rhs));
     return floor_div(node, eval(node->lhs), eval(node->rhs));
   case ND_NEG:
     return wrap32(-(uint64_t)eval(node->lhs));
@@ -1769,9 +1845,9 @@ static int64_t eval2(Node *node, char ***label) {
     return eval(node->lhs) || eval(node->rhs);
   case ND_CAST: {
     int64_t val = eval2(node->lhs, label);
-    if (node->ty->kind == TY_BOOL && (!label || !*label))
-      return val != 0;
-    return wrap32(val);
+    if (label && *label)
+      return wrap32(val);
+    return convert_const(node, node->lhs->ty, val);
   }
   case ND_ADDR:
     return eval_rval(node->lhs, label);
@@ -1849,9 +1925,19 @@ static bool is_const_expr(Node *node) {
   return false;
 }
 
+// Evaluates an integer constant expression, such as an array size or a
+// case label. A floating constant is only allowed behind a cast to an
+// integer type, as in `(int)2.5`.
+static int64_t eval_int(Node *node) {
+  add_type(node);
+  if (is_flonum(node->ty))
+    error_tok(node->tok, "integer constant expression required");
+  return eval(node);
+}
+
 int64_t const_expr(Token **rest, Token *tok) {
   Node *node = conditional(rest, tok);
-  return eval(node);
+  return eval_int(node);
 }
 
 // Convert op= operators to expressions containing an assignment.
@@ -2135,6 +2221,9 @@ static Node *new_add(Node *lhs, Node *rhs, Token *tok) {
     rhs = tmp;
   }
 
+  if (is_flonum(rhs->ty))
+    error_tok(tok, "array subscript is not an integer");
+
   // ptr + num. Scalars are one slot, so most pointers need no scaling.
   if (lhs->ty->base->size != 1)
     rhs = new_binary(ND_MUL, rhs, new_long(lhs->ty->base->size, tok), tok);
@@ -2149,6 +2238,9 @@ static Node *new_sub(Node *lhs, Node *rhs, Token *tok) {
   // num - num
   if (is_numeric(lhs->ty) && is_numeric(rhs->ty))
     return new_binary(ND_SUB, lhs, rhs, tok);
+
+  if (lhs->ty->base && is_flonum(rhs->ty))
+    error_tok(tok, "array subscript is not an integer");
 
   // ptr - num
   if (lhs->ty->base && is_integer(rhs->ty)) {

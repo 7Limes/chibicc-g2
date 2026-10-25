@@ -287,7 +287,11 @@ struct Node {
   // Assignment that initializes a variable, which is allowed for const
   bool is_init;
 
-  // Numeric literal
+  // A warning about this node was already printed. Constant expressions
+  // can be evaluated more than once.
+  bool warned;
+
+  // Numeric literal. For a floating type, this is the raw Q16.16 value.
   int64_t val;
 };
 
@@ -295,6 +299,14 @@ Node *new_cast(Node *expr, Type *ty);
 int64_t wrap32(int64_t val);
 int64_t floor_div(Node *node, int64_t a, int64_t b);
 int64_t floor_mod(Node *node, int64_t a, int64_t b);
+
+// Floats are Q16.16 fixed point: a float x is stored as round(x * FIX_ONE).
+#define FIX_ONE 65536
+int64_t fix_from_int(Node *node, int64_t n);
+int64_t fix_to_int(int64_t raw);
+int64_t fix_mul(int64_t a, int64_t b);
+int64_t fix_div(Node *node, int64_t a, int64_t b);
+int64_t convert_const(Node *node, Type *from, int64_t val);
 int64_t const_expr(Token **rest, Token *tok);
 Obj *parse(Token *tok);
 

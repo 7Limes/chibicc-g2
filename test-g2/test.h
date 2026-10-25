@@ -18,4 +18,7 @@ static void assert_eq(int line, int expected, int actual) {
 
 #define ASSERT(x, y) assert_eq(__LINE__, x, y)
 
+// The raw Q16.16 value of a float: fbits(1.5) == 98304.
+static int fbits(float f) { return *(int *)&f; }
+
 void tick() {}

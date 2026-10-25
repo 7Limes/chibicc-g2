@@ -18,7 +18,8 @@ Type *ty_ushort = &(Type){TY_SHORT, 1, 1};
 Type *ty_uint = &(Type){TY_INT, 1, 1};
 Type *ty_ulong = &(Type){TY_LONG, 1, 1};
 
-// Floating-point types exist only so that the parser can reject them.
+// Floating types are Q16.16 fixed point, one slot each. All three have
+// the same representation, so conversions between them are no-ops.
 Type *ty_float = &(Type){TY_FLOAT, 1, 1};
 Type *ty_double = &(Type){TY_DOUBLE, 1, 1};
 Type *ty_ldouble = &(Type){TY_LDOUBLE, 1, 1};
@@ -138,9 +139,24 @@ static Type *get_common_type(Type *ty1, Type *ty2) {
   if (ty2->kind == TY_FUNC)
     return pointer_to(ty2);
 
+  // If either operand is floating, the result is the wider floating
+  // type, as in C (they all have the same representation on g2).
+  if (ty1->kind == TY_LDOUBLE || ty2->kind == TY_LDOUBLE)
+    return ty_ldouble;
+  if (ty1->kind == TY_DOUBLE || ty2->kind == TY_DOUBLE)
+    return ty_double;
+  if (ty1->kind == TY_FLOAT || ty2->kind == TY_FLOAT)
+    return ty_float;
+
   // All integer types are 32-bit signed on g2, so the usual arithmetic
   // conversions always produce int.
   return ty_int;
+}
+
+// %, ~, &, |, ^, << and >> need integer operands.
+static void check_integer_operands(Node *node) {
+  if ((node->lhs && is_flonum(node->lhs->ty)) || (node->rhs && is_flonum(node->rhs->ty)))
+    error_tok(node->tok, "invalid operands to %.*s (floating operand)", node->tok->len, node->tok->loc);
 }
 
 // For many binary operators, we implicitly promote operands so that
@@ -177,14 +193,16 @@ void add_type(Node *node) {
   case ND_NUM:
     node->ty = ty_int;
     return;
-  case ND_ADD:
-  case ND_SUB:
-  case ND_MUL:
-  case ND_DIV:
   case ND_MOD:
   case ND_BITAND:
   case ND_BITOR:
   case ND_BITXOR:
+    check_integer_operands(node);
+    // fallthrough
+  case ND_ADD:
+  case ND_SUB:
+  case ND_MUL:
+  case ND_DIV:
     usual_arith_conv(&node->lhs, &node->rhs);
     node->ty = node->lhs->ty;
     return;
@@ -221,6 +239,7 @@ void add_type(Node *node) {
   case ND_BITNOT:
   case ND_SHL:
   case ND_SHR:
+    check_integer_operands(node);
     node->ty = node->lhs->ty;
     return;
   case ND_VAR:
